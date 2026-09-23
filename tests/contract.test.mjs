@@ -21,6 +21,11 @@ assert.match(source, /watchDirectory/)
 assert.doesNotMatch(source, /row\.status\s*!==\s*['"]enabled['"]/)
 
 assert.match(source, /hasBlockingFinding/)
+assert.match(source, /SECURITY_MODES/)
+assert.match(source, /security\.mode/)
+assert.match(source, /Smart:/)
+assert.match(source, /Strict:/)
+assert.match(source, /Off:/)
 assert.match(source, /scanSource/)
 assert.match(source, /SECURITY_RULES/)
 assert.match(source, /MND001/)
@@ -33,6 +38,5 @@ assert.match(source, /MenderPage/)
 assert.match(source, /MenderStatus/)
 assert.match(source, /buildHalfRows/)
 assert.match(source, /mender-state\.json/)
-
 
 console.log('mender-contract: ok')
