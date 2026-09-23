@@ -28,7 +28,13 @@ Current rule groups cover:
 - environment/secret access;
 - clipboard and external-URL access.
 
-Critical findings block automatic repair. High/medium findings are reported in the Mender UI/state and require human interpretation.
+Security policy is user-selectable and persisted with Hermes plugin storage:
+
+- **Smart**: critical findings block; high/medium findings are review signals.
+- **Strict**: critical and high findings block.
+- **Off**: Mender's supplemental scan is skipped.
+
+Off never changes Hermes Core's `plugins.scan_on_install` setting. Server-side plugin installation remains subject to the host-owned Hermes scanner.
 
 This scanner deliberately does **not** say that a plugin is safe. Static inspection can miss obfuscated, indirect, dependency-driven, or runtime behavior.
 

@@ -45,7 +45,13 @@ Raw plugin logs are intentionally not duplicated. Hermes already records Desktop
 
 Before Mender automatically materializes a missing half, it performs bounded static inspection of the source it is about to use.
 
-Critical findings block automatic repair. High and medium findings are surfaced for review.
+Mender has three persisted modes:
+
+- **Smart** (default): critical findings block automatic repair; high/medium findings stay visible.
+- **Strict**: critical and high findings block automatic repair.
+- **Off**: disables only Mender's supplemental preflight.
+
+Mender never turns off Hermes' own host-owned `plugins.scan_on_install` control. Agent/server installs still pass through Hermes Core's install scanner.
 
 This is a **risk preflight, not a proof of safety**. The strongest trust property is reproducibility: Mender repairs from the exact catalog/installed 40-character commit SHA, not a moving branch head.
 

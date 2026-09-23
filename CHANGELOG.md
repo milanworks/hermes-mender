@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.0
+## 0.3.0-dev
+
+- Add persistent Smart / Strict / Off security modes.
+- Smart remains the default: critical findings block; high/medium remain visible.
+- Strict blocks critical and high findings.
+- Off disables only Mender's supplemental preflight; Hermes Core scan-on-install is never changed.
+
+## 0.2.0-dev
 
 - Rename project/plugin to **Hermes Mender**.
 - Reconcile unified packages in both directions.

@@ -9,7 +9,7 @@ import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_ARE
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
-const VERSION = '0.2.0'
+const VERSION = '0.3.0-dev'
 const CHECK_MS = 20000
 let timer = null
 let running = false
@@ -17,6 +17,9 @@ let lastRun = null
 let directoryWatchId = null
 let stopDirectoryEvents = null
 const probeCache = new Map()
+const SECURITY_MODES = new Set(['smart', 'strict', 'off'])
+const securityMode = atom('smart')
+let pluginStorage = null
 
 function freshState() {
   return {
@@ -114,8 +117,19 @@ function scanSource(source, file = 'plugin.js') {
   return findings
 }
 
-function hasBlockingFinding(findings) {
+function hasBlockingFinding(findings, mode = securityMode.get()) {
+  if (mode === 'off') return false
+  if (mode === 'strict') {
+    return (findings || []).some(finding => finding.severity === 'critical' || finding.severity === 'high')
+  }
   return (findings || []).some(finding => finding.severity === 'critical')
+}
+
+function setSecurityMode(mode) {
+  const next = SECURITY_MODES.has(mode) ? mode : 'smart'
+  securityMode.set(next)
+  pluginStorage?.set('security.mode', next)
+  void reconcile('security-mode')
 }
 
 function riskCounts(findings) {
@@ -388,7 +402,7 @@ async function ensureRemoteDesktopHalves(desktop, root, report = null) {
     const pluginSource = pinnedFiles.find(file => file.name === 'plugin.js')?.text || ''
     const expectedId = extractPluginId(pluginSource) || row.name || entry.name
     attempt.expectedId = expectedId
-    attempt.findings = pinnedFiles.flatMap(file => scanSource(file.text, 'desktop/' + file.name))
+    attempt.findings = securityMode.get() === 'off' ? [] : pinnedFiles.flatMap(file => scanSource(file.text, 'desktop/' + file.name))
     if (report?.findings) report.findings.push(...attempt.findings.map(finding => ({ ...finding, plugin: row.catalog_name })))
     if (hasBlockingFinding(attempt.findings)) {
       attempt.stage = 'review-blocked'
@@ -481,7 +495,7 @@ async function ensureAgentHalves(desktop, root, report = null) {
       continue
     }
 
-    attempt.findings = sourceFiles.flatMap(file => scanSource(file.text, file.path))
+    attempt.findings = securityMode.get() === 'off' ? [] : sourceFiles.flatMap(file => scanSource(file.text, file.path))
     if (report?.findings) {
       report.findings.push(...attempt.findings.map(finding => ({ ...finding, plugin: entry.name })))
     }
@@ -586,10 +600,12 @@ async function reconcile(reason = 'timer') {
 
     report.halves = buildHalfRows(rows, inventory, catalog)
 
-    for (const local of inventory.byId.values()) {
-      if (local.id === ID) continue
-      const findings = scanSource(local.source, 'plugin.js')
-      report.findings.push(...findings.map(finding => ({ ...finding, plugin: local.id })))
+      if (securityMode.get() !== 'off') {
+      for (const local of inventory.byId.values()) {
+        if (local.id === ID) continue
+        const findings = scanSource(local.source, 'plugin.js')
+        report.findings.push(...findings.map(finding => ({ ...finding, plugin: local.id })))
+      }
     }
 
     const unique = new Map()
@@ -674,6 +690,7 @@ function severityClass(severity) {
 
 function MenderPage() {
   const state = useValue(menderState)
+  const mode = useValue(securityMode)
   const counts = riskCounts(state.findings)
 
   return jsxs('div', {
@@ -704,6 +721,42 @@ function MenderPage() {
       state.error
         ? jsx('div', { className: 'rounded-md border border-red-500/40 p-3 text-red-400', children: state.error })
         : null,
+
+      jsxs('section', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-3',
+            children: [
+              jsxs('div', {
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Security mode' }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      mode === 'strict'
+                        ? 'Strict: critical and high findings block Mender auto-repair.'
+                        : mode === 'off'
+                          ? 'Off: Mender preflight is disabled. Hermes Core scan-on-install remains untouched.'
+                          : 'Smart: critical findings block; high and medium findings stay visible for review.'
+                  })
+                ]
+              }),
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: ['smart', 'strict', 'off'].map(option =>
+                  jsx(Button, {
+                    size: 'sm',
+                    variant: 'outline',
+                    onClick: () => setSecurityMode(option),
+                    children: (mode === option ? '✓ ' : '') + option[0].toUpperCase() + option.slice(1)
+                  }, option)
+                )
+              })
+            ]
+          })
+        ]
+      }),
 
       jsxs('div', {
         className: 'grid grid-cols-4 gap-2',
@@ -815,6 +868,10 @@ const plugin = {
   id: ID,
   name: 'Mender',
   register(ctx) {
+    pluginStorage = ctx.storage
+    const savedMode = ctx.storage.get('security.mode', 'smart')
+    securityMode.set(SECURITY_MODES.has(savedMode) ? savedMode : 'smart')
+
     void reconcile('startup')
     void startDirectoryWatch().catch(error => warn('directory watch unavailable:', String(error)))
 
@@ -832,6 +889,7 @@ const plugin = {
         void window.hermesDesktop.stopPreviewFileWatch(directoryWatchId).catch(() => undefined)
       }
       directoryWatchId = null
+      pluginStorage = null
     })
     ctx.register({
       id: 'page',

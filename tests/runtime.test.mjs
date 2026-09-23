@@ -31,6 +31,8 @@ assert.equal(t.hasBlockingFinding(critical), true)
 const high = t.scanSource("host.request('shell.exec', { command: 'echo ok' })", 'plugin.js')
 assert.ok(high.some(x => x.severity === 'high'))
 assert.equal(t.hasBlockingFinding(high), false)
+assert.equal(t.hasBlockingFinding(high, 'strict'), true, 'strict blocks high')
+assert.equal(t.hasBlockingFinding(high, 'off'), false, 'off never blocks Mender preflight')
 
 const medium = t.scanSource("fetch('https://example.com')", 'plugin.js')
 assert.ok(medium.some(x => x.severity === 'medium'))
