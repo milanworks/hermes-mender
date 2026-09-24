@@ -47,4 +47,33 @@ assert.equal(t.catalogEntryForLocal({ id: 'foo', folder: 'foo' }, catalog).name,
 assert.equal(t.catalogEntryForLocal({ id: 'different', folder: 'bar' }, catalog).name, 'bar')
 assert.equal(t.catalogEntryForLocal({ id: 'none', folder: 'none' }, catalog), null)
 
+assert.equal(
+  t.isExpectedMissingHalf({ agentExpected: false, agent: false, desktopExpected: true, desktop: true }),
+  false,
+  'desktop-only plugins are not missing an agent half'
+)
+assert.equal(
+  t.isExpectedMissingHalf({ agentExpected: true, agent: false, desktopExpected: true, desktop: true }),
+  true,
+  'unified package with missing agent half is missing'
+)
+
+const previousComplete = { agent: true, desktop: true }
+const nowAgentGone = { agentExpected: true, desktopExpected: true, agent: false, desktop: true }
+assert.equal(
+  t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'timer'),
+  true,
+  'automatic reconcile treats a previously-complete package losing its agent half as uninstall intent'
+)
+assert.equal(
+  t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'manual'),
+  false,
+  'manual Repair now overrides the uninstall tombstone'
+)
+assert.equal(
+  t.shouldTreatAsIntentionalAgentRemoval({ agent: false, desktop: true }, nowAgentGone, 'timer'),
+  false,
+  'first-time incomplete installs are still repairable'
+)
+
 console.log('mender-runtime: ok')
