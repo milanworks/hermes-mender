@@ -76,4 +76,9 @@ assert.equal(
   'first-time incomplete installs are still repairable'
 )
 
+assert.equal(t.desktopUpdateTextFile('plugin.js'), true)
+assert.equal(t.desktopUpdateTextFile('theme.css'), true)
+assert.equal(t.desktopUpdateTextFile('icon.svg'), true)
+assert.equal(t.desktopUpdateTextFile('payload.bin'), false)
+
 console.log('mender-runtime: ok')

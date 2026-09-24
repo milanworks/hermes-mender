@@ -71,3 +71,29 @@ Before promotion to `main`, also run live integration tests:
 ## Retirement
 
 The project should be removed rather than expanded indefinitely after Hermes upstream reliably reconciles both halves and uses collision-free Desktop directory naming.
+
+## User-controlled repair policy
+
+Mender keeps behavior preferences in Hermes plugin storage rather than hardcoding them per machine:
+
+- `repair.respectUninstallIntent` defaults to `true`.
+- `repair.autoEnableAgents` defaults to `false`.
+- `security.mode` defaults to `smart`.
+
+The UI is the source of truth for these switches. The same atoms are consumed by reconcile/install code so there is no separate hidden policy path.
+
+### Enable action
+
+Installed-but-disabled Agent halves use the canonical `plugins.manage toggle` action addressed by the gateway-provided plugin key. Mender does not fall back to a collision-prone bare-name toggle.
+
+### Update all
+
+One controller handles batch updates:
+
+1. Catalog Agent/unified packages with `update_available` use `plugins.manage update`.
+2. Capability widening stops at `consent_required`; Mender does not send `accept_capabilities: true` automatically.
+3. The Hermes catalog re-pin path performs the normal host install scan before swapping the new tree.
+4. Supported Desktop-only catalog packages are compared with their current immutable catalog pin, Mender security-scanned, then updated in place with rollback of overwritten text files on failure.
+5. One reconcile refreshes both halves afterward.
+
+No second copy of a plugin is created for updates.

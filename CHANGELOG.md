@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0-dev
+
+- Add UI toggle for intentional-uninstall protection.
+- Add UI toggle for automatic enablement of repaired Agent halves.
+- Add per-plugin Enable action for installed-but-disabled Agent halves.
+- Add unified Update all controller with Hermes capability-consent handling and Mender security preflight.
+- Add checked in-place updates for supported Desktop-only catalog plugins without duplicate installs.
+- Change summary cards to Missing / Blocked now / Critical signals / Advisory signals.
+- Add visible `by @milanworks` project attribution.
+
+
 ## 0.3.1-dev
 
 - Do not count true Desktop-only packages as missing Agent halves.

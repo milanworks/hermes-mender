@@ -1,5 +1,5 @@
 /**
- * Hermes Plugin Repair
+ * Hermes Mender
  *
  * Repairs Desktop halves of catalog-installed unified plugins when Hermes Desktop
  * is connected to a remote gateway. Uses the backend's installed SHA, never branch
@@ -9,7 +9,7 @@ import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_ARE
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
-const VERSION = '0.3.1-dev'
+const VERSION = '0.4.0-dev'
 const CHECK_MS = 20000
 let timer = null
 let running = false
@@ -19,6 +19,9 @@ let stopDirectoryEvents = null
 const probeCache = new Map()
 const SECURITY_MODES = new Set(['smart', 'strict', 'off'])
 const securityMode = atom('smart')
+const respectUninstallIntent = atom(true)
+const autoEnableRepairedAgents = atom(false)
+const operationBusy = atom(false)
 const UNINSTALL_TOMBSTONE_TTL_MS = 10 * 60 * 1000
 let pluginStorage = null
 
@@ -131,6 +134,13 @@ function setSecurityMode(mode) {
   securityMode.set(next)
   pluginStorage?.set('security.mode', next)
   void reconcile('security-mode')
+}
+
+function setBooleanPreference(key, target, value) {
+  const next = Boolean(value)
+  target.set(next)
+  pluginStorage?.set(key, next)
+  void reconcile('preference-change')
 }
 
 function riskCounts(findings) {
@@ -520,6 +530,11 @@ function shouldTreatAsIntentionalAgentRemoval(previous, item, reason = 'timer') 
 }
 
 async function syncIntentionalAgentRemovals(desktop, halves, inventory, report, reason) {
+  if (!respectUninstallIntent.get()) {
+    writeUninstallTombstones({})
+    return new Set()
+  }
+
   const previous = readPackageSnapshot()
   const tombstones = reason === 'manual' ? {} : readUninstallTombstones()
   const now = Date.now()
@@ -621,7 +636,7 @@ async function ensureAgentHalves(desktop, root, report = null, skipCatalogs = ne
       const result = await host.request('plugins.manage', {
         action: 'install',
         catalog_name: entry.name,
-        enable: false
+        enable: autoEnableRepairedAgents.get()
       })
 
       if (!result?.ok) {
@@ -675,7 +690,10 @@ async function buildHalfRows(desktop, rows, inventory, catalog) {
       agentExpected: true,
       desktopExpected: true,
       agent: true,
+      agentName: row.name || row.catalog_name,
+      agentKey: row.key || null,
       agentStatus: row.status || 'installed',
+      updateAvailable: Boolean(row.update_available),
       desktop: Boolean(local),
       desktopId: local?.id || null,
       desktopPath: local?.path || null,
@@ -825,6 +843,232 @@ async function reconcile(reason = 'timer') {
   }
 }
 
+async function setAgentEnabled(item, enable = true) {
+  if (!item?.agentKey || operationBusy.get()) return
+  operationBusy.set(true)
+
+  try {
+    const result = await host.request('plugins.manage', {
+      action: 'toggle',
+      key: item.agentKey,
+      enable: Boolean(enable)
+    })
+
+    if (!result?.ok) {
+      throw new Error(result?.error || 'Hermes rejected the plugin toggle')
+    }
+
+    await reconcile(enable ? 'enable-agent' : 'disable-agent')
+  } catch (error) {
+    menderState.set({
+      ...menderState.get(),
+      error: error instanceof Error ? error.message : String(error)
+    })
+  } finally {
+    operationBusy.set(false)
+  }
+}
+
+function desktopUpdateTextFile(name) {
+  return /\.(?:js|mjs|cjs|json|css|html|md|txt|svg)$/i.test(String(name || ''))
+}
+
+async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findings) {
+  const inventory = await localPluginInventory(desktop, root)
+
+  for (const local of inventory.byId.values()) {
+    if (local.id === ID) continue
+
+    const entry = catalogEntryForLocal(local, catalog)
+    if (!entry?.repo || !/^[0-9a-f]{40}$/i.test(String(entry.sha || ''))) continue
+
+    const probe = await probeUnifiedPackage(desktop, entry)
+    if (!probe?.ok || probe.agent || !probe.desktop) continue
+
+    let pinnedFiles
+    try {
+      pinnedFiles = await fetchPinnedDesktopFiles(entry, entry.sha)
+    } catch (error) {
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-check-failed',
+        detail: error instanceof Error ? error.message : String(error)
+      })
+      continue
+    }
+
+    if (pinnedFiles.some(file => !desktopUpdateTextFile(file.name))) {
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-review-required',
+        detail: 'Package contains non-text Desktop files; automatic update skipped.'
+      })
+      continue
+    }
+
+    const scan = securityMode.get() === 'off'
+      ? []
+      : pinnedFiles.flatMap(file => scanSource(file.text, 'desktop/' + file.name))
+
+    findings.push(...scan.map(finding => ({ ...finding, plugin: entry.name })))
+
+    if (hasBlockingFinding(scan)) {
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-security-blocked',
+        detail: 'Mender security policy blocked the Desktop-only update.'
+      })
+      continue
+    }
+
+    const expectedId = extractPluginId(pinnedFiles.find(file => file.name === 'plugin.js')?.text || '')
+    if (expectedId && expectedId !== local.id) {
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-review-required',
+        detail: 'Pinned plugin ID differs from the installed plugin ID.'
+      })
+      continue
+    }
+
+    let changed = false
+    const originals = []
+
+    for (const file of pinnedFiles) {
+      const path = joinPath(local.path, file.name)
+      try {
+        const current = await desktop.readFileText(path)
+        const text = String(current?.text || '')
+        originals.push({ path, existed: true, text })
+        if (text !== file.text) changed = true
+      } catch {
+        originals.push({ path, existed: false, text: '' })
+        changed = true
+      }
+    }
+
+    if (!changed) continue
+
+    try {
+      const ordered = [
+        ...pinnedFiles.filter(file => file.name !== 'plugin.js'),
+        ...pinnedFiles.filter(file => file.name === 'plugin.js')
+      ]
+
+      for (const file of ordered) {
+        await desktop.writeTextFile(joinPath(local.path, file.name), file.text)
+      }
+
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-applied',
+        detail: 'Updated Desktop-only package to pin ' + String(entry.sha).slice(0, 8) + '.'
+      })
+    } catch (error) {
+      for (const original of originals.reverse()) {
+        try {
+          if (original.existed) {
+            await desktop.writeTextFile(original.path, original.text)
+          } else if (desktop.trashPath) {
+            await desktop.trashPath(original.path)
+          }
+        } catch {}
+      }
+
+      actions.push({
+        plugin: entry.name,
+        type: 'desktop-update-failed',
+        detail: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+}
+
+async function updateAllPlugins() {
+  if (operationBusy.get()) return
+  operationBusy.set(true)
+
+  const actions = []
+  const findings = []
+
+  try {
+    const desktop = window.hermesDesktop
+    if (!desktop?.desktopPluginsRoot) throw new Error('Hermes Desktop plugin bridge unavailable')
+
+    const root = await desktop.desktopPluginsRoot()
+    const catalog = await readCatalog(desktop, root)
+    const response = await host.request('plugins.manage', { action: 'list' })
+    const rows = Array.isArray(response?.plugins) ? response.plugins : []
+
+    for (const row of rows) {
+      if (!row?.catalog_name || !row?.update_available) continue
+
+      try {
+        const result = await host.request('plugins.manage', {
+          action: 'update',
+          name: row.name
+        })
+
+        if (result?.consent_required) {
+          actions.push({
+            plugin: row.catalog_name,
+            type: 'update-review-required',
+            detail: (result.delta_lines || []).slice(0, 4).join(' · ') || 'Update widens plugin capabilities.'
+          })
+          continue
+        }
+
+        if (!result?.ok) {
+          if (result?.scan_blocked) {
+            actions.push({
+              plugin: row.catalog_name,
+              type: 'hermes-core-update-blocked',
+              detail: result?.error || 'Hermes Core security scan blocked the update.'
+            })
+          } else {
+            actions.push({
+              plugin: row.catalog_name,
+              type: 'update-failed',
+              detail: result?.error || 'Hermes rejected the update.'
+            })
+          }
+          continue
+        }
+
+        actions.push({
+          plugin: row.catalog_name,
+          type: result?.unchanged ? 'update-unchanged' : 'update-applied',
+          detail: result?.unchanged ? 'Already at current catalog pin.' : 'Updated through plugins.manage.'
+        })
+      } catch (error) {
+        actions.push({
+          plugin: row.catalog_name,
+          type: 'update-failed',
+          detail: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+
+    await updateDesktopOnlyPackages(desktop, root, catalog, actions, findings)
+    await desktop.reconcileDesktopPlugins?.().catch(() => undefined)
+    await reconcile('update-all')
+
+    const current = menderState.get()
+    menderState.set({
+      ...current,
+      findings: [...findings, ...(current.findings || [])].slice(0, 160),
+      actions: [...actions, ...(current.actions || [])].slice(0, 60)
+    })
+  } catch (error) {
+    menderState.set({
+      ...menderState.get(),
+      error: error instanceof Error ? error.message : String(error)
+    })
+  } finally {
+    operationBusy.set(false)
+  }
+}
+
 async function startDirectoryWatch() {
   const desktop = window.hermesDesktop
   if (!desktop?.desktopPluginsRoot || !desktop?.watchDirectory || !desktop?.onPreviewFileChanged) return
@@ -848,10 +1092,60 @@ function severityClass(severity) {
   return 'text-(--ui-text-tertiary)'
 }
 
+function BooleanChoice({ value, onChange, disabled = false }) {
+  return jsxs('div', {
+    className: 'flex items-center gap-1',
+    children: [
+      jsx(Button, {
+        size: 'sm',
+        variant: 'outline',
+        disabled,
+        onClick: () => onChange(true),
+        children: (value ? '✓ ' : '') + 'On'
+      }),
+      jsx(Button, {
+        size: 'sm',
+        variant: 'outline',
+        disabled,
+        onClick: () => onChange(false),
+        children: (!value ? '✓ ' : '') + 'Off'
+      })
+    ]
+  })
+}
+
+function PreferenceRow({ title, description, value, onChange, disabled = false }) {
+  return jsxs('div', {
+    className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+    children: [
+      jsxs('div', {
+        className: 'min-w-0',
+        children: [
+          jsx('div', { className: 'font-medium', children: title }),
+          jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: description })
+        ]
+      }),
+      jsx(BooleanChoice, { value, onChange, disabled })
+    ]
+  })
+}
+
 function MenderPage() {
   const state = useValue(menderState)
   const mode = useValue(securityMode)
+  const respectUninstall = useValue(respectUninstallIntent)
+  const autoEnable = useValue(autoEnableRepairedAgents)
+  const busy = useValue(operationBusy)
   const counts = riskCounts(state.findings)
+  const blockedStages = new Set([
+    'review-blocked',
+    'agent-review-blocked',
+    'hermes-core-blocked',
+    'hermes-core-update-blocked',
+    'desktop-update-security-blocked'
+  ])
+  const blockedNow = (state.actions || []).filter(action => blockedStages.has(action.type)).length
+  const advisory = counts.high + counts.medium
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-4 overflow-auto p-5 text-sm',
@@ -864,16 +1158,28 @@ function MenderPage() {
               jsx('div', { className: 'text-lg font-semibold', children: 'Hermes Mender' }),
               jsx('div', {
                 className: 'text-(--ui-text-tertiary)',
-                children: 'Bidirectional unified-plugin repair · v' + state.version
+                children: 'Bidirectional unified-plugin repair · v' + state.version + ' · by @milanworks'
               })
             ]
           }),
-          jsx(Button, {
-            size: 'sm',
-            variant: 'outline',
-            disabled: state.running,
-            onClick: () => void reconcile('manual'),
-            children: state.running ? 'Checking…' : 'Repair now'
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: state.running || busy,
+                onClick: () => void updateAllPlugins(),
+                children: busy ? 'Working…' : 'Update all'
+              }),
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: state.running || busy,
+                onClick: () => void reconcile('manual'),
+                children: state.running ? 'Checking…' : 'Repair now'
+              })
+            ]
           })
         ]
       }),
@@ -918,13 +1224,36 @@ function MenderPage() {
         ]
       }),
 
+      jsxs('section', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'font-medium', children: 'Repair behavior' }),
+          jsx(PreferenceRow, {
+            title: 'Respect uninstall actions',
+            description:
+              'On: a previously complete unified package that loses its Agent half is treated as intentionally removed, so Mender will not immediately reinstall it. Repair now overrides this protection.',
+            value: respectUninstall,
+            disabled: busy,
+            onChange: value => setBooleanPreference('repair.respectUninstallIntent', respectUninstallIntent, value)
+          }),
+          jsx(PreferenceRow, {
+            title: 'Auto-enable repaired Agent halves',
+            description:
+              'Off by default: repaired Agent halves are installed disabled and can be enabled explicitly per plugin. On: successful repairs are enabled immediately after Hermes security checks pass.',
+            value: autoEnable,
+            disabled: busy,
+            onChange: value => setBooleanPreference('repair.autoEnableAgents', autoEnableRepairedAgents, value)
+          })
+        ]
+      }),
+
       jsxs('div', {
         className: 'grid grid-cols-4 gap-2',
         children: [
           jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Missing: ' + state.missing }),
-          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Critical: ' + counts.critical }),
-          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'High: ' + counts.high }),
-          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Medium: ' + counts.medium })
+          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Blocked now: ' + blockedNow }),
+          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Critical signals: ' + counts.critical }),
+          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Advisory signals: ' + advisory })
         ]
       }),
 
@@ -937,7 +1266,7 @@ function MenderPage() {
                 className: 'flex flex-col gap-1',
                 children: state.halves.map(item =>
                   jsxs('div', {
-                    className: 'grid grid-cols-[1fr_auto_auto] items-center gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                    className: 'grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
                     children: [
                       jsxs('div', {
                         children: [
@@ -967,7 +1296,18 @@ function MenderPage() {
                               : item.desktopExpected === true
                                 ? 'Desktop ✕'
                                 : 'Desktop ?'
-                      })
+                      }),
+                      item.agent &&
+                      item.agentStatus !== 'enabled' &&
+                      item.agentKey
+                        ? jsx(Button, {
+                            size: 'xs',
+                            variant: 'outline',
+                            disabled: busy || state.running,
+                            onClick: () => void setAgentEnabled(item, true),
+                            children: 'Enable'
+                          })
+                        : jsx('span', { className: 'w-14' })
                     ]
                   }, item.catalog)
                 )
@@ -1050,6 +1390,8 @@ const plugin = {
     pluginStorage = ctx.storage
     const savedMode = ctx.storage.get('security.mode', 'smart')
     securityMode.set(SECURITY_MODES.has(savedMode) ? savedMode : 'smart')
+    respectUninstallIntent.set(Boolean(ctx.storage.get('repair.respectUninstallIntent', true)))
+    autoEnableRepairedAgents.set(Boolean(ctx.storage.get('repair.autoEnableAgents', false)))
 
     void reconcile('startup')
     void startDirectoryWatch().catch(error => warn('directory watch unavailable:', String(error)))
@@ -1109,4 +1451,4 @@ const plugin = {
 }
 
 export default plugin
-export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval }
+export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile }

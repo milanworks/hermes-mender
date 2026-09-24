@@ -47,3 +47,15 @@ The unrelated community project named **Hermes Plugin Guard** is a broader stati
 Mender contains no user-specific names, machine IDs, hostnames, addresses, tokens, server IPs, or account identifiers.
 
 Diagnostics are written locally to the Hermes cache and normal Desktop log only.
+
+## Activation policy
+
+Repair and activation are separate decisions.
+
+By default, a reconstructed Agent/server half is installed with `enable: false`. The Mender row then exposes an explicit **Enable** action using Hermes' canonical plugin key. Users can opt into automatic enablement with the persisted UI switch, but the Hermes install scan still runs first.
+
+## Update policy
+
+**Update all** never auto-accepts a capability-widening catalog update. Hermes returns `consent_required`; Mender reports that as review-required and leaves the installed tree unchanged.
+
+Desktop-only updates are Mender-scanned before any file is changed. Packages with unsupported non-text Desktop payloads are skipped for review rather than guessed at.

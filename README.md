@@ -1,5 +1,7 @@
 # Hermes Mender
 
+**by [@milanworks](https://github.com/milanworks)**
+
 Hermes Mender is a temporary Hermes Desktop plugin that repairs incomplete **unified plugin** installations when Hermes Desktop is connected to a local or remote Hermes gateway.
 
 It targets two Hermes Desktop edge cases:
@@ -42,6 +44,15 @@ The page shows:
 `Repair now` performs an immediate full reconcile and also clears short-lived uninstall tombstones. That makes it the explicit recovery action when a half was removed by mistake and should be restored.
 
 Raw plugin logs are intentionally not duplicated. Hermes already records Desktop/plugin console output in its normal Desktop log.
+
+## Repair behavior
+
+Mender keeps repair controls in one place:
+
+- **Respect uninstall actions** — default **On**. If a previously complete unified package loses its Agent half, Mender treats that as intentional removal instead of immediately restoring it. **Repair now** explicitly overrides that short-lived protection.
+- **Auto-enable repaired Agent halves** — default **Off**. A repaired Agent half is installed disabled. Turn this on only if you want successful repairs to activate immediately after the security checks.
+- Installed-but-disabled Agent halves show an **Enable** action directly in the Mender row.
+- **Update all** updates every supported catalog-installed package through one controller. Agent/unified packages use `plugins.manage update`; capability-widening updates stop at **Review required** instead of auto-consenting. Desktop-only catalog packages are compared against the pinned catalog files, scanned, then updated in place without creating a duplicate installation.
 
 ## Security preflight
 
