@@ -28,6 +28,10 @@ For every installed gateway plugin that reports `has_desktop_half` and catalog p
 
 This applies to installed packages even when their status is `not enabled` or `disabled`.
 
+### Uninstall intent
+
+Hermes currently exposes no dedicated third-party Desktop-plugin event that says `plugins.manage remove` was invoked. Mender therefore persists the last complete half-state. When a previously complete unified package suddenly loses its Agent half while the Desktop half remains, automatic reconciliation treats that transition as uninstall intent instead of re-installing the Agent half. The tombstone is short-lived and a manual **Repair now** deliberately overrides it.
+
 ### Reconcile B — Desktop to server
 
 For a local Desktop plugin with no matching gateway package:
