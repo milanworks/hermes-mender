@@ -39,6 +39,8 @@ The page shows:
 - the most recent repair actions;
 - a manual **Repair now** action.
 
+`Repair now` performs an immediate full reconcile and also clears short-lived uninstall tombstones. That makes it the explicit recovery action when a half was removed by mistake and should be restored.
+
 Raw plugin logs are intentionally not duplicated. Hermes already records Desktop/plugin console output in its normal Desktop log.
 
 ## Security preflight
