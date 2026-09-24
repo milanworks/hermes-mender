@@ -9,7 +9,7 @@ import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_ARE
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
-const VERSION = '0.3.0-dev'
+const VERSION = '0.3.1-dev'
 const CHECK_MS = 20000
 let timer = null
 let running = false
@@ -19,6 +19,7 @@ let stopDirectoryEvents = null
 const probeCache = new Map()
 const SECURITY_MODES = new Set(['smart', 'strict', 'off'])
 const securityMode = atom('smart')
+const UNINSTALL_TOMBSTONE_TTL_MS = 10 * 60 * 1000
 let pluginStorage = null
 
 function freshState() {
@@ -459,7 +460,114 @@ async function ensureRemoteDesktopHalves(desktop, root, report = null) {
 
   return installed
 }
-async function ensureAgentHalves(desktop, root, report = null) {
+function readPackageSnapshot() {
+  const value = pluginStorage?.get('packages.snapshot', {})
+  return value && typeof value === 'object' ? value : {}
+}
+
+function writePackageSnapshot(halves) {
+  if (!pluginStorage) return
+  const snapshot = {}
+  for (const item of halves || []) {
+    snapshot[item.catalog] = {
+      agent: Boolean(item.agent),
+      desktop: Boolean(item.desktop),
+      agentExpected: item.agentExpected !== false,
+      desktopExpected: item.desktopExpected !== false
+    }
+  }
+  pluginStorage.set('packages.snapshot', snapshot)
+}
+
+function readUninstallTombstones() {
+  const value = pluginStorage?.get('uninstall.tombstones', {})
+  const now = Date.now()
+  const next = {}
+
+  if (value && typeof value === 'object') {
+    for (const [name, at] of Object.entries(value)) {
+      const ts = Number(at)
+      if (Number.isFinite(ts) && now - ts < UNINSTALL_TOMBSTONE_TTL_MS) {
+        next[name] = ts
+      }
+    }
+  }
+
+  return next
+}
+
+function writeUninstallTombstones(value) {
+  pluginStorage?.set('uninstall.tombstones', value)
+}
+
+function isExpectedMissingHalf(item) {
+  return Boolean(
+    (item?.agentExpected === true && !item?.agent) ||
+    (item?.desktopExpected === true && !item?.desktop)
+  )
+}
+
+function shouldTreatAsIntentionalAgentRemoval(previous, item, reason = 'timer') {
+  if (reason === 'manual') return false
+  return Boolean(
+    item?.agentExpected === true &&
+    item?.desktopExpected === true &&
+    !item?.agent &&
+    item?.desktop &&
+    previous?.agent === true &&
+    previous?.desktop === true
+  )
+}
+
+async function syncIntentionalAgentRemovals(desktop, halves, inventory, report, reason) {
+  const previous = readPackageSnapshot()
+  const tombstones = reason === 'manual' ? {} : readUninstallTombstones()
+  const now = Date.now()
+
+  for (const item of halves || []) {
+    if (item.agent) {
+      if (tombstones[item.catalog]) delete tombstones[item.catalog]
+      continue
+    }
+
+    if (shouldTreatAsIntentionalAgentRemoval(previous[item.catalog], item, reason)) {
+      tombstones[item.catalog] = now
+    }
+  }
+
+  for (const item of halves || []) {
+    if (!tombstones[item.catalog] || item.agent || !item.desktop) continue
+
+    const local = item.desktopId ? inventory.byId.get(item.desktopId) : null
+    const path = local?.path || item.desktopPath || null
+    const attempt = {
+      name: item.catalog,
+      catalog: item.catalog,
+      stage: 'uninstall-sync',
+      error: null
+    }
+    report?.attempts?.push(attempt)
+
+    if (!path || !desktop.trashPath) {
+      attempt.stage = 'uninstall-sync-pending'
+      attempt.error = 'Local Desktop half could not be removed automatically'
+      continue
+    }
+
+    try {
+      await desktop.trashPath(path)
+      attempt.stage = 'uninstall-synced'
+    } catch (error) {
+      attempt.stage = 'uninstall-sync-pending'
+      attempt.error = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  writeUninstallTombstones(tombstones)
+  return new Set(Object.keys(tombstones))
+}
+
+async function ensureAgentHalves(desktop, root, report = null, skipCatalogs = new Set()) {
   const response = await host.request('plugins.manage', { action: 'list' })
   const rows = Array.isArray(response?.plugins) ? response.plugins : []
   const catalog = await readCatalog(desktop, root)
@@ -476,6 +584,10 @@ async function ensureAgentHalves(desktop, root, report = null) {
 
     const entry = catalogEntryForLocal(local, catalog)
     if (!entry?.repo || installedCatalogs.has(entry.name)) continue
+    if (skipCatalogs.has(entry.name)) {
+      report?.attempts?.push({ name: local.id, catalog: entry.name, stage: 'uninstall-tombstone', error: null })
+      continue
+    }
 
     const probe = await probeUnifiedPackage(desktop, entry)
     if (!probe?.ok || !probe.agent || !probe.desktop) continue
@@ -513,8 +625,29 @@ async function ensureAgentHalves(desktop, root, report = null) {
       })
 
       if (!result?.ok) {
-        attempt.stage = 'agent-install-failed'
-        attempt.error = result?.error || 'Gateway rejected install'
+        if (result?.scan_blocked) {
+          attempt.stage = 'hermes-core-blocked'
+          attempt.error = result?.error || 'Hermes Core security scan blocked install'
+          for (const finding of result?.scan_findings || []) {
+            report?.findings?.push({
+              id: 'HERMES:' + String(finding.pattern_id || 'scan'),
+              severity:
+                finding.severity === 'critical'
+                  ? 'critical'
+                  : finding.severity === 'high'
+                    ? 'high'
+                    : 'medium',
+              label: String(finding.description || finding.category || 'Hermes Core security finding'),
+              file: String(finding.file || 'server package'),
+              line: Number(finding.line || 0),
+              plugin: entry.name,
+              source: 'hermes-core'
+            })
+          }
+        } else {
+          attempt.stage = 'agent-install-failed'
+          attempt.error = result?.error || 'Gateway rejected install'
+        }
         continue
       }
 
@@ -528,18 +661,24 @@ async function ensureAgentHalves(desktop, root, report = null) {
   }
 }
 
-function buildHalfRows(rows, inventory, catalog) {
+async function buildHalfRows(desktop, rows, inventory, catalog) {
   const result = []
   const seen = new Set()
 
   for (const row of rows) {
     if (!row?.has_desktop_half || !row?.catalog_name) continue
 
+    const local = inventory.byId.get(row.name) || inventory.byId.get(row.catalog_name) || null
+
     result.push({
       catalog: row.catalog_name,
+      agentExpected: true,
+      desktopExpected: true,
       agent: true,
       agentStatus: row.status || 'installed',
-      desktop: inventory.byId.has(row.name) || inventory.byFolder.has(row.catalog_name),
+      desktop: Boolean(local),
+      desktopId: local?.id || null,
+      desktopPath: local?.path || null,
       sha: row.installed_sha || row.pinned_sha || null
     })
     seen.add(row.catalog_name)
@@ -550,11 +689,19 @@ function buildHalfRows(rows, inventory, catalog) {
     const entry = catalogEntryForLocal(local, catalog)
     if (!entry || seen.has(entry.name)) continue
 
+    const probe = await probeUnifiedPackage(desktop, entry)
+    const agentExpected = probe?.ok ? Boolean(probe.agent) : null
+    const desktopExpected = probe?.ok ? Boolean(probe.desktop) : true
+
     result.push({
       catalog: entry.name,
+      agentExpected,
+      desktopExpected,
       agent: false,
-      agentStatus: 'missing',
+      agentStatus: agentExpected === false ? 'desktop only' : agentExpected === true ? 'missing' : 'unknown',
       desktop: true,
+      desktopId: local.id,
+      desktopPath: local.path,
       sha: entry.sha || null
     })
   }
@@ -590,15 +737,28 @@ async function reconcile(reason = 'timer') {
     root = await desktop.desktopPluginsRoot()
     await repairCatalogFolder(desktop, root)
 
+    const catalog = await readCatalog(desktop, root)
+    const initial = await host.request('plugins.manage', { action: 'list' })
+    const initialRows = Array.isArray(initial?.plugins) ? initial.plugins : []
+    let inventory = await localPluginInventory(desktop, root)
+    const initialHalves = await buildHalfRows(desktop, initialRows, inventory, catalog)
+    const uninstallTombstones = await syncIntentionalAgentRemovals(
+      desktop,
+      initialHalves,
+      inventory,
+      report,
+      reason
+    )
+
     report.installed = await ensureRemoteDesktopHalves(desktop, root, report)
-    await ensureAgentHalves(desktop, root, report)
+    await ensureAgentHalves(desktop, root, report, uninstallTombstones)
 
     const latest = await host.request('plugins.manage', { action: 'list' })
     const rows = Array.isArray(latest?.plugins) ? latest.plugins : []
-    const catalog = await readCatalog(desktop, root)
-    const inventory = await localPluginInventory(desktop, root)
+    inventory = await localPluginInventory(desktop, root)
 
-    report.halves = buildHalfRows(rows, inventory, catalog)
+    report.halves = await buildHalfRows(desktop, rows, inventory, catalog)
+    writePackageSnapshot(report.halves)
 
       if (securityMode.get() !== 'off') {
       for (const local of inventory.byId.values()) {
@@ -615,7 +775,7 @@ async function reconcile(reason = 'timer') {
     }
     report.findings = [...unique.values()].slice(0, 160)
 
-    const missing = report.halves.filter(item => !item.agent || !item.desktop).length
+    const missing = report.halves.filter(isExpectedMissingHalf).length
     const actions = report.attempts
       .filter(item => !['already-local', 'already-local-name', 'candidate'].includes(item.stage))
       .map(item => ({
@@ -788,8 +948,26 @@ function MenderPage() {
                           })
                         ]
                       }),
-                      jsx('span', { children: item.agent ? 'Agent ✓' : 'Agent ✕' }),
-                      jsx('span', { children: item.desktop ? 'Desktop ✓' : 'Desktop ✕' })
+                      jsx('span', {
+                        children:
+                          item.agentExpected === false
+                            ? 'Agent —'
+                            : item.agent
+                              ? 'Agent ✓'
+                              : item.agentExpected === true
+                                ? 'Agent ✕'
+                                : 'Agent ?'
+                      }),
+                      jsx('span', {
+                        children:
+                          item.desktopExpected === false
+                            ? 'Desktop —'
+                            : item.desktop
+                              ? 'Desktop ✓'
+                              : item.desktopExpected === true
+                                ? 'Desktop ✕'
+                                : 'Desktop ?'
+                      })
                     ]
                   }, item.catalog)
                 )
@@ -804,7 +982,8 @@ function MenderPage() {
           jsx('div', { className: 'font-medium', children: 'Security preflight' }),
           jsx('div', {
             className: 'text-xs text-(--ui-text-tertiary)',
-            children: 'Static review only: critical findings block automatic repair; high and medium findings are review signals, not a safety verdict.'
+            children:
+              'Critical = block-worthy malware-like signal. High = powerful/risky capability that needs review. Medium = capability/egress signal. Findings are not proof of malware; Hermes Core scan blocks dangerous server installs before placement.'
           }),
           state.findings.length
             ? jsx('div', {
@@ -930,4 +1109,4 @@ const plugin = {
 }
 
 export default plugin
-export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, shouldScanRuntimePath, catalogEntryForLocal }
+export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval }
