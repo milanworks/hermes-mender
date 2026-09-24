@@ -31,8 +31,8 @@ assert.equal(t.hasBlockingFinding(critical), true)
 const high = t.scanSource("host.request('shell.exec', { command: 'echo ok' })", 'plugin.js')
 assert.ok(high.some(x => x.severity === 'high'))
 assert.equal(t.hasBlockingFinding(high), false)
-assert.equal(t.hasBlockingFinding(high, 'strict'), true, 'strict blocks high')
-assert.equal(t.hasBlockingFinding(high, 'off'), false, 'off never blocks Mender preflight')
+assert.equal(t.hasBlockingFinding(high, 'strict'), true)
+assert.equal(t.hasBlockingFinding(high, 'off'), false)
 
 const medium = t.scanSource("fetch('https://example.com')", 'plugin.js')
 assert.ok(medium.some(x => x.severity === 'medium'))
@@ -49,36 +49,104 @@ assert.equal(t.catalogEntryForLocal({ id: 'none', folder: 'none' }, catalog), nu
 
 assert.equal(
   t.isExpectedMissingHalf({ agentExpected: false, agent: false, desktopExpected: true, desktop: true }),
-  false,
-  'desktop-only plugins are not missing an agent half'
+  false
 )
 assert.equal(
   t.isExpectedMissingHalf({ agentExpected: true, agent: false, desktopExpected: true, desktop: true }),
-  true,
-  'unified package with missing agent half is missing'
+  true
 )
 
 const previousComplete = { agent: true, desktop: true }
 const nowAgentGone = { agentExpected: true, desktopExpected: true, agent: false, desktop: true }
-assert.equal(
-  t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'timer'),
-  true,
-  'automatic reconcile treats a previously-complete package losing its agent half as uninstall intent'
-)
-assert.equal(
-  t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'manual'),
-  false,
-  'manual Repair now overrides the uninstall tombstone'
-)
-assert.equal(
-  t.shouldTreatAsIntentionalAgentRemoval({ agent: false, desktop: true }, nowAgentGone, 'timer'),
-  false,
-  'first-time incomplete installs are still repairable'
-)
+assert.equal(t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'timer'), true)
+assert.equal(t.shouldTreatAsIntentionalAgentRemoval(previousComplete, nowAgentGone, 'manual'), false)
+assert.equal(t.shouldTreatAsIntentionalAgentRemoval({ agent: false, desktop: true }, nowAgentGone, 'timer'), false)
 
 assert.equal(t.desktopUpdateTextFile('plugin.js'), true)
 assert.equal(t.desktopUpdateTextFile('theme.css'), true)
 assert.equal(t.desktopUpdateTextFile('icon.svg'), true)
 assert.equal(t.desktopUpdateTextFile('payload.bin'), false)
+
+const coreWrite = t.scanCoreTamperSource(
+  "const p = '/usr/local/lib/hermes-agent/hermes_cli/main.py'; write_text(p, 'x')",
+  'plugin.py'
+)
+assert.ok(coreWrite.some(x => x.id === 'CORE001' && x.severity === 'critical'))
+assert.equal(t.hasCoreProtectionBlocker(coreWrite, 'smart'), false, 'Smart asks; it does not hard-block')
+assert.equal(t.hasCoreProtectionBlocker(coreWrite, 'strict'), true, 'Strict blocks Core tamper')
+assert.equal(t.hasCoreProtectionBlocker(coreWrite, 'off'), false, 'Off allows Core tamper at the Mender layer')
+
+const internalOnly = t.scanCoreTamperSource("from hermes_cli import plugins_cmd", 'plugin.py')
+assert.ok(internalOnly.some(x => x.id === 'CORE102' && x.severity === 'medium'))
+assert.equal(t.hasCoreProtectionBlocker(internalOnly, 'strict'), false)
+
+const internalPatch = t.scanCoreTamperSource(
+  "from hermes_cli import plugins_cmd\nmock.patch.object(plugins_cmd, 'x', 1)",
+  'plugin.py'
+)
+assert.ok(internalPatch.some(x => x.id === 'CORE101' && x.severity === 'high'))
+assert.equal(t.hasCoreProtectionBlocker(internalPatch, 'strict'), true)
+
+const supportedOverrideDeclaration = t.scanCoreTamperSource(
+  "capabilities: ['tools.override', 'llm.model_override']",
+  'plugin.yaml'
+)
+assert.equal(supportedOverrideDeclaration.length, 0)
+
+const shaA = 'a'.repeat(40)
+const shaB = 'b'.repeat(40)
+assert.equal(t.coreApprovalKey('owner/repo', shaA), 'owner/repo@' + shaA)
+assert.equal(t.coreApprovalKey('owner/repo', 'short'), null)
+
+let pf = t.runPreflight(
+  [{ path: 'plugin.py', text: "const p = '/usr/local/lib/hermes-agent/hermes_cli/main.py'; write_text(p, 'x')" }],
+  { identity: 'owner/repo', sha: shaA }
+)
+let decision = t.preflightDecision(pf, 'owner/repo', shaA)
+assert.equal(decision.allowed, false)
+assert.equal(decision.stage, 'core-review-required')
+assert.equal(decision.canApproveCore, true)
+
+assert.equal(t.setCoreVersionApproval('owner/repo', shaA, true), true)
+assert.equal(t.isCoreVersionApproved('owner/repo', shaA), true)
+assert.equal(t.isCoreVersionApproved('owner/repo', shaB), false)
+
+pf = t.runPreflight(
+  [{ path: 'plugin.py', text: "const p = '/usr/local/lib/hermes-agent/hermes_cli/main.py'; write_text(p, 'x')" }],
+  { identity: 'owner/repo', sha: shaA }
+)
+decision = t.preflightDecision(pf, 'owner/repo', shaA)
+assert.equal(decision.allowed, true, 'exact SHA approval allows Core protection exception')
+
+const differentSha = t.runPreflight(
+  [{ path: 'plugin.py', text: "const p = '/usr/local/lib/hermes-agent/hermes_cli/main.py'; write_text(p, 'x')" }],
+  { identity: 'owner/repo', sha: shaB }
+)
+assert.equal(t.preflightDecision(differentSha, 'owner/repo', shaB).stage, 'core-review-required')
+
+const securityStillBlocks = t.runPreflight(
+  [{ path: 'plugin.js', text: "eval('x')" }],
+  { identity: 'owner/repo', sha: shaA }
+)
+assert.equal(t.preflightDecision(securityStillBlocks, 'owner/repo', shaA).stage, 'security-blocked')
+assert.equal(t.preflightDecision(securityStillBlocks, 'owner/repo', shaA).canApproveCore, false)
+
+const parsedShort = t.parseGitHubInstallIdentifier('owner/repo#catalog')
+assert.equal(parsedShort.slug, 'owner/repo')
+assert.equal(parsedShort.subdir, 'catalog')
+assert.equal(parsedShort.identity, 'owner/repo#catalog')
+
+const parsedUrl = t.parseGitHubInstallIdentifier('https://github.com/owner/repo/tree/main/catalog')
+assert.equal(parsedUrl.slug, 'owner/repo')
+assert.equal(parsedUrl.ref, 'main')
+assert.equal(parsedUrl.subdir, 'catalog')
+
+assert.throws(() => t.parseGitHubInstallIdentifier('https://example.com/owner/repo'))
+assert.throws(() => t.parseGitHubInstallIdentifier('owner/repo#../escape'))
+
+assert.equal(t.safeCliPluginName('hermes-rss'), 'hermes-rss')
+assert.equal(t.safeCliPluginName('quota.v2'), 'quota.v2')
+assert.equal(t.safeCliPluginName('bad;whoami'), null)
+assert.equal(t.safeCliPluginName('../escape'), null)
 
 console.log('mender-runtime: ok')

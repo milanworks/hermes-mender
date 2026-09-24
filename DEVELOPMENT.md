@@ -82,6 +82,10 @@ Mender keeps behavior preferences in Hermes plugin storage rather than hardcodin
 
 The UI is the source of truth for these switches. The same atoms are consumed by reconcile/install code so there is no separate hidden policy path.
 
+### Core protection
+
+`coreProtection.mode` is persisted independently from `security.mode` and defaults to `smart`. Smart pauses and asks on detected Core tampering; Strict blocks; Off allows at the Mender layer. Exact-version exceptions live in `coreProtection.approvals` and are keyed by plugin identity + full commit SHA. All Mender-controlled install/update paths call the same `runPreflight()` / `preflightDecision()` path so Core-protection policy is not duplicated.
+
 ### Enable action
 
 Installed-but-disabled Agent halves use the canonical `plugins.manage toggle` action addressed by the gateway-provided plugin key. Mender does not fall back to a collision-prone bare-name toggle.
@@ -97,3 +101,21 @@ One controller handles batch updates:
 5. One reconcile refreshes both halves afterward.
 
 No second copy of a plugin is created for updates.
+
+### GitHub installer
+
+The public-GitHub installer is intentionally separate from private-repository credential handling.
+
+1. Parse a `https://github.com/owner/repo` URL or `owner/repo` identifier; an optional package subdirectory is supported.
+2. Resolve the requested/default ref to a full 40-character Git commit SHA.
+3. Ask Hermes `probePluginRepo` which halves exist and reject a shape mismatch between the live probe and the pinned commit.
+4. Run the shared Mender security/Core preflight against the pinned source.
+5. Agent install: `plugins.manage install` with `ref: sha`, `force: false`, and the user-selected enable flag.
+6. Desktop install: use the Hermes Desktop installer with `force: false`, then reconcile the materialized files to the same checked SHA and canonical plugin ID.
+7. Reconcile the final half-state.
+
+The installer never auto-accepts a general Security-mode block. A Core-protection exception can be granted only for the exact identity + SHA. Private GitHub repositories remain the responsibility of Hermes' own Git credential/installer flow.
+
+### Exact-version Core approvals
+
+`coreApprovalKey(identity, sha)` is the only approval key constructor. Approvals are persisted in plugin storage and are not inherited across commits. Revocation deletes that key. The UI exposes approval only on Core-protection decisions; normal Security findings do not get the override action.

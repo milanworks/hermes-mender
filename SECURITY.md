@@ -59,3 +59,21 @@ By default, a reconstructed Agent/server half is installed with `enable: false`.
 **Update all** never auto-accepts a capability-widening catalog update. Hermes returns `consent_required`; Mender reports that as review-required and leaves the installed tree unchanged.
 
 Desktop-only updates are Mender-scanned before any file is changed. Packages with unsupported non-text Desktop payloads are skipped for review rather than guessed at.
+
+## Core-integrity policy
+
+Mender keeps Core-integrity checks separate from general malware/capability findings.
+
+- **Smart** pauses on detected Core tampering and requires a decision.
+- **Strict** blocks detected Core tampering by default.
+- **Off** allows Core tampering at the Mender layer.
+
+A deliberate exception can be created only for an exact plugin identity + 40-character commit SHA. That approval is stored separately, shown in the UI, can be revoked, and is not inherited by another commit. The exception affects Core protection only; it cannot override a general Security-mode block or Hermes' own host scanner.
+
+Direct imports of Hermes internals are review signals rather than automatic malware verdicts. Declared, supported Hermes capabilities such as `tools.override` and `llm.model_override` are not considered Core tampering on their own.
+
+This is defense-in-depth, not a sandbox. In-process plugins inherit the permissions of the Hermes process. A read-only/immutable Hermes application tree remains the strongest technical boundary against runtime Core modification.
+
+## Uninstall fallback safety
+
+The compatibility fallback is used only when the connected gateway rejects the current remove RPC with the specific legacy-contract error. Mender validates the canonical plugin name against a strict allowlist before composing the official `hermes plugins remove <name>` command. Arbitrary shell text is never accepted from the UI.

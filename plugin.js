@@ -9,7 +9,7 @@ import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_ARE
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
-const VERSION = '0.4.0-dev'
+const VERSION = '0.6.0-dev'
 const CHECK_MS = 20000
 let timer = null
 let running = false
@@ -18,10 +18,23 @@ let directoryWatchId = null
 let stopDirectoryEvents = null
 const probeCache = new Map()
 const SECURITY_MODES = new Set(['smart', 'strict', 'off'])
+const CORE_PROTECTION_MODES = new Set(['smart', 'strict', 'off'])
 const securityMode = atom('smart')
+const coreProtectionMode = atom('smart')
+const coreVersionApprovals = atom({})
 const respectUninstallIntent = atom(true)
 const autoEnableRepairedAgents = atom(false)
 const operationBusy = atom(false)
+const installIdentifier = atom('')
+const installEnableAfter = atom(false)
+const installState = atom({
+  status: 'idle',
+  message: '',
+  identity: null,
+  sha: null,
+  probe: null,
+  canApproveCore: false
+})
 const UNINSTALL_TOMBSTONE_TTL_MS = 10 * 60 * 1000
 let pluginStorage = null
 
@@ -129,11 +142,173 @@ function hasBlockingFinding(findings, mode = securityMode.get()) {
   return (findings || []).some(finding => finding.severity === 'critical')
 }
 
+const CORE_PATH_RE = /(?:\/usr\/local\/lib\/hermes-agent|[\\/]hermes-agent[\\/](?:hermes_cli|agent|tools|gateway|tui_gateway|apps[\\/]desktop)|site-packages[\\/](?:hermes_cli|agent|tools|gateway|tui_gateway))/i
+const CORE_MUTATION_RE = /(?:write_text|write_bytes|open\s*\([^\n]{0,80}["'](?:w|a|x)[+b]?|unlink\s*\(|remove\s*\(|rmtree\s*\(|rename\s*\(|replace\s*\(|copy(?:file|tree)?\s*\(|move\s*\(|git\s+(?:apply|checkout|reset)|patch\s+-p|sed\s+-i)/i
+const CORE_INTERNAL_IMPORT_RE = /^\s*(?:from|import)\s+(?:hermes_cli|gateway|tui_gateway|agent|tools)(?:\.|\s|$)/m
+const CORE_RUNTIME_PATCH_RE = /(?:sys\.modules\s*\[[^\]]*(?:hermes_cli|gateway|tui_gateway|agent|tools)[^\]]*\]\s*=|setattr\s*\([^\n]{0,120}(?:hermes_cli|gateway|tui_gateway|agent|tools)|mock\.patch(?:\.object)?\s*\([^\n]{0,120}(?:hermes_cli|gateway|tui_gateway|agent|tools))/i
+const CORE_ENV_MUTATION_RE = /(?:sys\.executable[^\n]{0,160}-m\s+pip\s+install|(?:pip|uv\s+pip)\s+install[^\n]{0,180}(?:site-packages|hermes-agent|hermes_cli))/i
+
+function scanCoreTamperSource(source, file = 'plugin.js') {
+  const text = String(source || '')
+  const findings = []
+  const push = (id, severity, label, index = 0) => findings.push({
+    id,
+    severity,
+    label,
+    file,
+    line: lineForOffset(text, Math.max(0, index)),
+    source: 'core-protection'
+  })
+
+  const pathMatch = text.match(CORE_PATH_RE)
+  const mutationMatch = text.match(CORE_MUTATION_RE)
+
+  if (pathMatch && mutationMatch) {
+    push(
+      'CORE001',
+      'critical',
+      'direct mutation of Hermes install/core path',
+      Math.min(pathMatch.index ?? 0, mutationMatch.index ?? 0)
+    )
+  }
+
+  const runtimePatch = text.match(CORE_RUNTIME_PATCH_RE)
+  if (runtimePatch) {
+    push('CORE002', 'critical', 'runtime patch of Hermes host module', runtimePatch.index ?? 0)
+  }
+
+  const envMutation = text.match(CORE_ENV_MUTATION_RE)
+  if (envMutation) {
+    push('CORE003', 'critical', 'package-manager mutation of Hermes host runtime', envMutation.index ?? 0)
+  }
+
+  const internalImport = text.match(CORE_INTERNAL_IMPORT_RE)
+  if (internalImport && (mutationMatch || /(?:monkeypatch|patch\.object|mock\.patch)/i.test(text))) {
+    push('CORE101', 'high', 'internal Hermes import combined with mutation/patch behavior', internalImport.index ?? 0)
+  } else if (internalImport) {
+    push('CORE102', 'medium', 'direct dependency on Hermes internal module', internalImport.index ?? 0)
+  }
+
+  if (pathMatch && !mutationMatch) {
+    push('CORE103', 'medium', 'references Hermes install/core path', pathMatch.index ?? 0)
+  }
+
+  return findings
+}
+
+function hasCoreProtectionBlocker(findings, mode = coreProtectionMode.get()) {
+  if (mode !== 'strict') return false
+  return (findings || []).some(finding => finding.severity === 'critical' || finding.severity === 'high')
+}
+
+function coreApprovalKey(identity, sha) {
+  const id = String(identity || '').trim()
+  const pin = String(sha || '').trim().toLowerCase()
+  if (!id || !/^[0-9a-f]{40}$/.test(pin)) return null
+  return id + '@' + pin
+}
+
+function isCoreVersionApproved(identity, sha) {
+  const key = coreApprovalKey(identity, sha)
+  return Boolean(key && coreVersionApprovals.get()?.[key])
+}
+
+function setCoreVersionApproval(identity, sha, allowed = true) {
+  const key = coreApprovalKey(identity, sha)
+  if (!key) return false
+
+  const next = { ...(coreVersionApprovals.get() || {}) }
+  if (allowed) {
+    next[key] = {
+      identity: String(identity),
+      sha: String(sha).toLowerCase(),
+      approvedAt: new Date().toISOString()
+    }
+  } else {
+    delete next[key]
+  }
+
+  coreVersionApprovals.set(next)
+  pluginStorage?.set('coreProtection.approvals', next)
+  return true
+}
+
+function runPreflight(files, context = {}) {
+  const security = securityMode.get() === 'off'
+    ? []
+    : (files || []).flatMap(file => scanSource(file.text, file.path || file.name || 'plugin.js'))
+  const core = (files || []).flatMap(file => scanCoreTamperSource(file.text, file.path || file.name || 'plugin.js'))
+
+  const coreMode = coreProtectionMode.get()
+  const coreTamper = core.some(finding => finding.severity === 'critical' || finding.severity === 'high')
+  const approved = isCoreVersionApproved(context.identity, context.sha)
+
+  return {
+    findings: [...security, ...core],
+    securityBlocked: hasBlockingFinding(security),
+    coreBlocked: !approved && hasCoreProtectionBlocker(core, coreMode),
+    reviewRequired: !approved && coreMode === 'smart' && coreTamper,
+    coreApproved: approved,
+    approvalKey: coreApprovalKey(context.identity, context.sha),
+    blocked: hasBlockingFinding(security) || (!approved && hasCoreProtectionBlocker(core, coreMode))
+  }
+}
+
+function preflightDecision(preflight, identity, sha) {
+  if (preflight?.securityBlocked) {
+    return {
+      allowed: false,
+      stage: 'security-blocked',
+      canApproveCore: false,
+      approvalIdentity: null,
+      approvalSha: null
+    }
+  }
+
+  if (preflight?.coreBlocked || preflight?.reviewRequired) {
+    const approvalKey = coreApprovalKey(identity, sha)
+    return {
+      allowed: false,
+      stage: preflight.coreBlocked ? 'core-blocked' : 'core-review-required',
+      canApproveCore: Boolean(approvalKey),
+      approvalIdentity: approvalKey ? String(identity) : null,
+      approvalSha: approvalKey ? String(sha).toLowerCase() : null
+    }
+  }
+
+  return {
+    allowed: true,
+    stage: 'allowed',
+    canApproveCore: false,
+    approvalIdentity: null,
+    approvalSha: null
+  }
+}
+
+function applyCoreApproval(identity, sha, resume = 'repair') {
+  if (!setCoreVersionApproval(identity, sha, true)) return
+
+  if (resume === 'update') {
+    void updateAllPlugins()
+  } else if (resume === 'install') {
+    void installFromInput()
+  } else {
+    void reconcile('core-approval')
+  }
+}
+
 function setSecurityMode(mode) {
   const next = SECURITY_MODES.has(mode) ? mode : 'smart'
   securityMode.set(next)
   pluginStorage?.set('security.mode', next)
   void reconcile('security-mode')
+}
+
+function setCoreProtectionMode(mode) {
+  const next = CORE_PROTECTION_MODES.has(mode) ? mode : 'smart'
+  coreProtectionMode.set(next)
+  pluginStorage?.set('coreProtection.mode', next)
+  void reconcile('core-protection-mode')
 }
 
 function setBooleanPreference(key, target, value) {
@@ -199,6 +374,133 @@ function githubRepoSlug(repoUrl) {
     return null
   }
 }
+function parseGitHubInstallIdentifier(value) {
+  const raw = String(value || '').trim()
+  if (!raw) throw new Error('Enter a GitHub repository URL or owner/repo.')
+
+  let owner = ''
+  let repo = ''
+  let subdir = ''
+  let ref = ''
+
+  if (/^https:\/\/github\.com\//i.test(raw)) {
+    const url = new URL(raw)
+    const hashSubdir = String(url.hash || '').replace(/^#/, '').replace(/^\/+|\/+$/g, '')
+    const parts = url.pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean)
+
+    if (parts.length < 2) throw new Error('GitHub URL must include owner and repository.')
+
+    owner = parts[0]
+    repo = parts[1].replace(/\.git$/i, '')
+
+    if (parts[2] === 'tree' && parts[3]) {
+      ref = decodeURIComponent(parts[3])
+      subdir = parts.slice(4).join('/')
+    } else if (parts.length > 2) {
+      subdir = parts.slice(2).join('/')
+    }
+
+    if (hashSubdir) subdir = hashSubdir
+  } else {
+    const hashIndex = raw.indexOf('#')
+    const beforeHash = hashIndex >= 0 ? raw.slice(0, hashIndex) : raw
+    const hashSubdir = hashIndex >= 0 ? raw.slice(hashIndex + 1) : ''
+    const parts = beforeHash.split('/').filter(Boolean)
+
+    if (parts.length < 2) throw new Error("Use 'owner/repo' or a GitHub URL.")
+
+    owner = parts[0]
+    repo = parts[1].replace(/\.git$/i, '')
+    subdir = hashSubdir || parts.slice(2).join('/')
+  }
+
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error('Unsupported GitHub owner/repository name.')
+  }
+
+  subdir = String(subdir || '').replace(/^\/+|\/+$/g, '')
+  if (subdir.includes('..') || subdir.includes('\\')) {
+    throw new Error('Unsafe repository subdirectory.')
+  }
+
+  const slug = owner + '/' + repo
+  const repoUrl = 'https://github.com/' + slug
+  const identifier = subdir ? repoUrl + '#' + subdir : repoUrl
+  const identity = subdir ? slug + '#' + subdir : slug
+
+  return { owner, repo, slug, repoUrl, subdir, ref, identifier, identity }
+}
+
+async function resolveGitHubInstallSha(target) {
+  let ref = String(target?.ref || '').trim()
+
+  if (!ref) {
+    const repoResponse = await fetch('https://api.github.com/repos/' + target.slug, {
+      headers: { Accept: 'application/vnd.github+json' }
+    })
+    if (!repoResponse.ok) {
+      throw new Error('GitHub repository lookup failed: HTTP ' + repoResponse.status)
+    }
+    const repo = await repoResponse.json()
+    ref = String(repo?.default_branch || '').trim()
+    if (!ref) throw new Error('GitHub default branch could not be resolved.')
+  }
+
+  const response = await fetch(
+    'https://api.github.com/repos/' + target.slug + '/commits/' + encodeURIComponent(ref),
+    { headers: { Accept: 'application/vnd.github+json' } }
+  )
+  if (!response.ok) throw new Error('GitHub commit lookup failed: HTTP ' + response.status)
+
+  const commit = await response.json()
+  const sha = String(commit?.sha || '').trim().toLowerCase()
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('GitHub did not return a full commit SHA.')
+  return sha
+}
+
+async function fetchGitHubDirectoryFiles(slug, directory, sha) {
+  const cleanDir = String(directory || '').replace(/^\/+|\/+$/g, '')
+  const suffix = cleanDir ? '/' + cleanDir.split('/').map(encodeURIComponent).join('/') : ''
+  const api = 'https://api.github.com/repos/' + slug + '/contents' + suffix + '?ref=' + sha
+  const response = await fetch(api, { headers: { Accept: 'application/vnd.github+json' } })
+  if (!response.ok) return null
+
+  const listing = await response.json()
+  if (!Array.isArray(listing)) return null
+
+  const files = []
+  for (const item of listing) {
+    if (item?.type !== 'file' || !item?.name || !item?.download_url) continue
+    if (Number(item.size || 0) > 1024 * 1024) {
+      throw new Error('GitHub file too large for checked Desktop install: ' + item.name)
+    }
+
+    const fileResponse = await fetch(item.download_url)
+    if (!fileResponse.ok) {
+      throw new Error('GitHub file fetch failed: ' + item.name + ' HTTP ' + fileResponse.status)
+    }
+    files.push({ name: item.name, text: await fileResponse.text() })
+  }
+
+  return files
+}
+
+async function fetchPinnedDesktopFilesForInstall(target, sha) {
+  const packageRoot = String(target?.subdir || '').replace(/^\/+|\/+$/g, '')
+  const desktopDir = packageRoot ? packageRoot + '/desktop' : 'desktop'
+  let files = await fetchGitHubDirectoryFiles(target.slug, desktopDir, sha)
+
+  if (!files?.some(file => file.name === 'plugin.js')) {
+    files = await fetchGitHubDirectoryFiles(target.slug, packageRoot, sha)
+  }
+
+  if (!files?.some(file => file.name === 'plugin.js')) {
+    throw new Error('Pinned GitHub commit has no Desktop plugin.js at the detected package root.')
+  }
+
+  return files
+}
+
 async function fetchPinnedDesktopFiles(entry, sha) {
   const slug = githubRepoSlug(entry?.repo)
   if (!slug || !/^[0-9a-f]{40}$/i.test(String(sha || ''))) {
@@ -398,6 +700,7 @@ async function ensureRemoteDesktopHalves(desktop, root, report = null) {
 
     const sha = String(row.installed_sha || entry.sha || '')
     if (!/^[0-9a-f]{40}$/i.test(sha)) continue
+    attempt.sha = sha
 
     let pinnedFiles
     try {
@@ -413,10 +716,15 @@ async function ensureRemoteDesktopHalves(desktop, root, report = null) {
     const pluginSource = pinnedFiles.find(file => file.name === 'plugin.js')?.text || ''
     const expectedId = extractPluginId(pluginSource) || row.name || entry.name
     attempt.expectedId = expectedId
-    attempt.findings = securityMode.get() === 'off' ? [] : pinnedFiles.flatMap(file => scanSource(file.text, 'desktop/' + file.name))
+    const preflight = runPreflight(
+      pinnedFiles.map(file => ({ ...file, path: 'desktop/' + file.name })),
+      { identity: row.catalog_name, sha }
+    )
+    attempt.findings = preflight.findings
     if (report?.findings) report.findings.push(...attempt.findings.map(finding => ({ ...finding, plugin: row.catalog_name })))
-    if (hasBlockingFinding(attempt.findings)) {
-      attempt.stage = 'review-blocked'
+    const decision = preflightDecision(preflight, row.catalog_name, sha)
+    if (!decision.allowed) {
+      Object.assign(attempt, decision)
       continue
     }
     if (inventory.byId.has(expectedId)) {
@@ -610,7 +918,7 @@ async function ensureAgentHalves(desktop, root, report = null, skipCatalogs = ne
     const sha = String(entry.sha || '')
     if (!/^[0-9a-f]{40}$/i.test(sha)) continue
 
-    const attempt = { name: local.id, catalog: entry.name, stage: 'agent-candidate', error: null }
+    const attempt = { name: local.id, catalog: entry.name, stage: 'agent-candidate', error: null, sha }
     report?.attempts?.push(attempt)
 
     let sourceFiles
@@ -622,13 +930,15 @@ async function ensureAgentHalves(desktop, root, report = null, skipCatalogs = ne
       continue
     }
 
-    attempt.findings = securityMode.get() === 'off' ? [] : sourceFiles.flatMap(file => scanSource(file.text, file.path))
+    const preflight = runPreflight(sourceFiles, { identity: entry.name, sha })
+    attempt.findings = preflight.findings
     if (report?.findings) {
       report.findings.push(...attempt.findings.map(finding => ({ ...finding, plugin: entry.name })))
     }
 
-    if (hasBlockingFinding(attempt.findings)) {
-      attempt.stage = 'agent-review-blocked'
+    const decision = preflightDecision(preflight, entry.name, sha)
+    if (!decision.allowed) {
+      Object.assign(attempt, decision)
       continue
     }
 
@@ -778,11 +1088,11 @@ async function reconcile(reason = 'timer') {
     report.halves = await buildHalfRows(desktop, rows, inventory, catalog)
     writePackageSnapshot(report.halves)
 
-      if (securityMode.get() !== 'off') {
+    if (securityMode.get() !== 'off' || coreProtectionMode.get() !== 'off') {
       for (const local of inventory.byId.values()) {
         if (local.id === ID) continue
-        const findings = scanSource(local.source, 'plugin.js')
-        report.findings.push(...findings.map(finding => ({ ...finding, plugin: local.id })))
+        const preflight = runPreflight([{ name: 'plugin.js', path: 'plugin.js', text: local.source }])
+        report.findings.push(...preflight.findings.map(finding => ({ ...finding, plugin: local.id })))
       }
     }
 
@@ -799,7 +1109,11 @@ async function reconcile(reason = 'timer') {
       .map(item => ({
         plugin: item.catalog || item.name,
         type: item.stage,
-        detail: item.error || (item.sha ? 'pin ' + String(item.sha).slice(0, 8) : '')
+        detail: item.error || (item.sha ? 'pin ' + String(item.sha).slice(0, 8) : ''),
+        canApproveCore: Boolean(item.canApproveCore),
+        approvalIdentity: item.approvalIdentity || null,
+        approvalSha: item.approvalSha || null,
+        resume: 'repair'
       }))
 
     lastRun = report
@@ -843,6 +1157,96 @@ async function reconcile(reason = 'timer') {
   }
 }
 
+function safeCliPluginName(name) {
+  const value = String(name || '')
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) ? value : null
+}
+
+function seedUninstallTombstone(item) {
+  if (!respectUninstallIntent.get() || !item?.catalog) return
+  const tombstones = readUninstallTombstones()
+  tombstones[item.catalog] = Date.now()
+  writeUninstallTombstones(tombstones)
+}
+
+async function uninstallPlugin(item) {
+  if (!item || operationBusy.get()) return
+
+  const confirmed =
+    typeof window.confirm !== 'function' ||
+    window.confirm('Remove ' + item.catalog + '? Mender will remove every installed half it manages for this package.')
+
+  if (!confirmed) return
+
+  operationBusy.set(true)
+  seedUninstallTombstone(item)
+
+  try {
+    const desktop = window.hermesDesktop
+
+    if (item.agent) {
+      let removed = false
+      let removeError = null
+
+      try {
+        const result = await host.request('plugins.manage', {
+          action: 'remove',
+          name: item.agentName || item.catalog
+        })
+        removed = Boolean(result?.ok)
+        if (!removed) removeError = result?.error || 'Hermes rejected plugin removal'
+      } catch (error) {
+        removeError = error instanceof Error ? error.message : String(error)
+      }
+
+      if (!removed && /unknown\s+plugins\s+action:\s*remove/i.test(String(removeError || ''))) {
+        const cliName = safeCliPluginName(item.agentName || item.catalog)
+        if (!cliName) {
+          throw new Error('Remote gateway lacks plugins.manage remove and the canonical plugin name is not safe for CLI fallback.')
+        }
+
+        const legacy = await host.request('shell.exec', {
+          command: 'hermes plugins remove ' + cliName
+        })
+
+        if (Number(legacy?.code ?? 1) !== 0) {
+          throw new Error(String(legacy?.stderr || legacy?.stdout || 'Legacy Hermes remove failed'))
+        }
+
+        removed = true
+      }
+
+      if (!removed) throw new Error(String(removeError || 'Plugin removal failed'))
+    } else if (item.agentExpected === false && item.desktop) {
+      if (desktop?.removeDesktopPlugin && item.desktopId) {
+        const result = await desktop.removeDesktopPlugin({ name: item.desktopId })
+        if (!result?.ok) throw new Error(result?.error || 'Desktop plugin removal failed')
+      } else if (desktop?.trashPath && item.desktopPath) {
+        await desktop.trashPath(item.desktopPath)
+      } else {
+        throw new Error('Desktop removal bridge unavailable')
+      }
+    }
+
+    if (item.desktop && item.desktopPath && desktop?.trashPath) {
+      try {
+        await desktop.trashPath(item.desktopPath)
+      } catch {
+        // The native unified-package reconcile may already have removed it.
+      }
+    }
+
+    await reconcile('uninstall-ui')
+  } catch (error) {
+    menderState.set({
+      ...menderState.get(),
+      error: error instanceof Error ? error.message : String(error)
+    })
+  } finally {
+    operationBusy.set(false)
+  }
+}
+
 async function setAgentEnabled(item, enable = true) {
   if (!item?.agentKey || operationBusy.get()) return
   operationBusy.set(true)
@@ -863,6 +1267,202 @@ async function setAgentEnabled(item, enable = true) {
     menderState.set({
       ...menderState.get(),
       error: error instanceof Error ? error.message : String(error)
+    })
+  } finally {
+    operationBusy.set(false)
+  }
+}
+
+function appendFindingsToState(findings, plugin) {
+  if (!findings?.length) return
+  const current = menderState.get()
+  const merged = [
+    ...(findings || []).map(finding => ({ ...finding, plugin })),
+    ...(current.findings || [])
+  ]
+  const unique = new Map()
+  for (const finding of merged) {
+    const key = [finding.plugin, finding.file, finding.line, finding.id].join('|')
+    unique.set(key, finding)
+  }
+  menderState.set({ ...current, findings: [...unique.values()].slice(0, 160) })
+}
+
+async function installFromInput() {
+  if (operationBusy.get()) return
+  const raw = String(installIdentifier.get() || '').trim()
+  if (!raw) {
+    installState.set({
+      status: 'error',
+      message: 'Enter a public GitHub repository URL or owner/repo.',
+      identity: null,
+      sha: null,
+      probe: null,
+      canApproveCore: false
+    })
+    return
+  }
+
+  operationBusy.set(true)
+  installState.set({
+    status: 'checking',
+    message: 'Resolving GitHub commit and checking plugin source…',
+    identity: null,
+    sha: null,
+    probe: null,
+    canApproveCore: false
+  })
+
+  try {
+    const desktop = window.hermesDesktop
+    if (!desktop?.desktopPluginsRoot || !desktop?.installDesktopPlugin) {
+      throw new Error('Hermes Desktop plugin install bridge is unavailable.')
+    }
+
+    const target = parseGitHubInstallIdentifier(raw)
+    const sha = await resolveGitHubInstallSha(target)
+    const entry = { repo: target.repoUrl, subdir: target.subdir || null }
+
+    const officialProbe = await desktop.probePluginRepo?.({ identifier: target.identifier })
+    if (!officialProbe?.ok || (!officialProbe.agent && !officialProbe.desktop)) {
+      throw new Error(officialProbe?.error || 'Hermes did not recognize this repository as a plugin.')
+    }
+
+    const sourceFiles = await fetchPinnedRuntimeFiles(entry, sha)
+    const pinnedHasAgent = sourceFiles.some(file => /(^|\/)plugin\.ya?ml$/i.test(String(file.path || '')))
+
+    let desktopFiles = []
+    try {
+      desktopFiles = await fetchPinnedDesktopFilesForInstall(target, sha)
+    } catch {
+      desktopFiles = []
+    }
+    const pinnedHasDesktop = desktopFiles.some(file => file.name === 'plugin.js')
+
+    if (
+      Boolean(officialProbe.agent) !== Boolean(pinnedHasAgent) ||
+      Boolean(officialProbe.desktop) !== Boolean(pinnedHasDesktop)
+    ) {
+      throw new Error('Repository changed while being checked. Retry so Hermes and Mender inspect the same plugin shape.')
+    }
+
+    const hasAgent = Boolean(officialProbe.agent && pinnedHasAgent)
+    const hasDesktop = Boolean(officialProbe.desktop && pinnedHasDesktop)
+
+    const filesToCheck = [
+      ...sourceFiles,
+      ...desktopFiles.map(file => ({ ...file, path: 'desktop/' + file.name }))
+    ]
+    const preflight = runPreflight(filesToCheck, { identity: target.identity, sha })
+    appendFindingsToState(preflight.findings, target.identity)
+
+    const decision = preflightDecision(preflight, target.identity, sha)
+    if (!decision.allowed) {
+      installState.set({
+        status: decision.stage,
+        message:
+          decision.stage === 'security-blocked'
+            ? 'General security policy blocked this install. Core exceptions cannot override it.'
+            : decision.stage === 'core-blocked'
+              ? 'Core protection Strict blocked this exact version. You can explicitly allow only this SHA below.'
+              : 'Core protection Smart requires approval before this exact version can be installed.',
+        identity: target.identity,
+        sha,
+        probe: { agent: hasAgent, desktop: hasDesktop },
+        canApproveCore: decision.canApproveCore
+      })
+      return
+    }
+
+    const outcomes = []
+
+    if (hasAgent) {
+      const result = await host.request('plugins.manage', {
+        action: 'install',
+        identifier: target.identifier,
+        ref: sha,
+        force: false,
+        enable: installEnableAfter.get()
+      })
+
+      if (!result?.ok) {
+        if (result?.scan_blocked) {
+          for (const finding of result?.scan_findings || []) {
+            appendFindingsToState([
+              {
+                id: 'HERMES:' + String(finding.pattern_id || 'scan'),
+                severity:
+                  finding.severity === 'critical'
+                    ? 'critical'
+                    : finding.severity === 'high'
+                      ? 'high'
+                      : 'medium',
+                label: String(finding.description || finding.category || 'Hermes Core security finding'),
+                file: String(finding.file || 'server package'),
+                line: Number(finding.line || 0),
+                source: 'hermes-core'
+              }
+            ], target.identity)
+          }
+        }
+        throw new Error(result?.error || 'Hermes rejected the Agent plugin install.')
+      }
+
+      outcomes.push('Agent installed' + (installEnableAfter.get() ? ' + enabled' : ' (disabled)'))
+    }
+
+    if (hasDesktop) {
+      const result = await desktop.installDesktopPlugin({
+        identifier: target.identifier,
+        force: false
+      })
+
+      if (!result?.ok || !result.path) {
+        throw new Error(result?.error || 'Hermes rejected the Desktop plugin install.')
+      }
+
+      await pinInstalledTree(desktop, result.path, desktopFiles)
+
+      const expectedId = extractPluginId(
+        desktopFiles.find(file => file.name === 'plugin.js')?.text || ''
+      )
+
+      if (expectedId && baseName(result.path) !== expectedId && desktop.renamePath) {
+        const root = await desktop.desktopPluginsRoot()
+        const inventory = await localPluginInventory(desktop, root)
+        const existing = inventory.byId.get(expectedId)
+        const existingFolder = inventory.byFolder.get(expectedId)
+
+        if (
+          (!existing || existing.path === result.path) &&
+          (!existingFolder || existingFolder === result.path)
+        ) {
+          await desktop.renamePath(result.path, expectedId)
+        }
+      }
+
+      outcomes.push('Desktop installed')
+    }
+
+    await desktop.reconcileDesktopPlugins?.().catch(() => undefined)
+    await reconcile('url-install')
+
+    installState.set({
+      status: 'success',
+      message: outcomes.join(' · ') + ' · pinned ' + sha.slice(0, 8),
+      identity: target.identity,
+      sha,
+      probe: { agent: hasAgent, desktop: hasDesktop },
+      canApproveCore: false
+    })
+  } catch (error) {
+    installState.set({
+      status: 'error',
+      message: error instanceof Error ? error.message : String(error),
+      identity: null,
+      sha: null,
+      probe: null,
+      canApproveCore: false
     })
   } finally {
     operationBusy.set(false)
@@ -906,17 +1506,28 @@ async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findin
       continue
     }
 
-    const scan = securityMode.get() === 'off'
-      ? []
-      : pinnedFiles.flatMap(file => scanSource(file.text, 'desktop/' + file.name))
+    const preflight = runPreflight(
+      pinnedFiles.map(file => ({ ...file, path: 'desktop/' + file.name })),
+      { identity: entry.name, sha: entry.sha }
+    )
 
-    findings.push(...scan.map(finding => ({ ...finding, plugin: entry.name })))
+    findings.push(...preflight.findings.map(finding => ({ ...finding, plugin: entry.name })))
 
-    if (hasBlockingFinding(scan)) {
+    const decision = preflightDecision(preflight, entry.name, entry.sha)
+    if (!decision.allowed) {
       actions.push({
         plugin: entry.name,
-        type: 'desktop-update-security-blocked',
-        detail: 'Mender security policy blocked the Desktop-only update.'
+        type: decision.stage,
+        detail:
+          decision.stage === 'security-blocked'
+            ? 'Mender security policy blocked the Desktop-only update.'
+            : decision.stage === 'core-blocked'
+              ? 'Core protection Strict mode blocked this Desktop-only update.'
+              : 'Core protection Smart mode requires approval for this exact version.',
+        canApproveCore: decision.canApproveCore,
+        approvalIdentity: decision.approvalIdentity,
+        approvalSha: decision.approvalSha,
+        resume: 'update'
       })
       continue
     }
@@ -1004,6 +1615,43 @@ async function updateAllPlugins() {
       if (!row?.catalog_name || !row?.update_available) continue
 
       try {
+        const entry = catalog.find(item => item?.name === row.catalog_name)
+        if (entry?.repo && /^[0-9a-f]{40}$/i.test(String(entry.sha || ''))) {
+          let sourceFiles
+          try {
+            sourceFiles = await fetchPinnedRuntimeFiles(entry, entry.sha)
+          } catch (error) {
+            actions.push({
+              plugin: row.catalog_name,
+              type: 'update-preflight-failed',
+              detail: error instanceof Error ? error.message : String(error)
+            })
+            continue
+          }
+
+          const preflight = runPreflight(sourceFiles, { identity: row.catalog_name, sha: entry.sha })
+          findings.push(...preflight.findings.map(finding => ({ ...finding, plugin: row.catalog_name })))
+
+          const decision = preflightDecision(preflight, row.catalog_name, entry.sha)
+          if (!decision.allowed) {
+            actions.push({
+              plugin: row.catalog_name,
+              type: decision.stage,
+              detail:
+                decision.stage === 'security-blocked'
+                  ? 'Mender security policy blocked the update before Hermes re-pin.'
+                  : decision.stage === 'core-blocked'
+                    ? 'Core protection Strict mode blocked this update.'
+                    : 'Core protection Smart mode requires approval for this exact version.',
+              canApproveCore: decision.canApproveCore,
+              approvalIdentity: decision.approvalIdentity,
+              approvalSha: decision.approvalSha,
+              resume: 'update'
+            })
+            continue
+          }
+        }
+
         const result = await host.request('plugins.manage', {
           action: 'update',
           name: row.name
@@ -1133,19 +1781,32 @@ function PreferenceRow({ title, description, value, onChange, disabled = false }
 function MenderPage() {
   const state = useValue(menderState)
   const mode = useValue(securityMode)
+  const coreMode = useValue(coreProtectionMode)
+  const approvals = useValue(coreVersionApprovals)
   const respectUninstall = useValue(respectUninstallIntent)
   const autoEnable = useValue(autoEnableRepairedAgents)
   const busy = useValue(operationBusy)
+  const installValue = useValue(installIdentifier)
+  const enableAfterInstall = useValue(installEnableAfter)
+  const install = useValue(installState)
+  const securityFindings = (state.findings || []).filter(finding => finding.source !== 'core-protection')
+  const coreFindings = (state.findings || []).filter(finding => finding.source === 'core-protection')
+  const securityCounts = riskCounts(securityFindings)
+  const coreCounts = riskCounts(coreFindings)
   const counts = riskCounts(state.findings)
   const blockedStages = new Set([
     'review-blocked',
+    'preflight-blocked',
     'agent-review-blocked',
+    'agent-preflight-blocked',
+    'security-blocked',
+    'core-blocked',
     'hermes-core-blocked',
     'hermes-core-update-blocked',
-    'desktop-update-security-blocked'
+    'desktop-update-security-blocked',
+    'desktop-update-preflight-blocked'
   ])
   const blockedNow = (state.actions || []).filter(action => blockedStages.has(action.type)).length
-  const advisory = counts.high + counts.medium
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-4 overflow-auto p-5 text-sm',
@@ -1227,6 +1888,79 @@ function MenderPage() {
       jsxs('section', {
         className: 'flex flex-col gap-2',
         children: [
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-3',
+            children: [
+              jsxs('div', {
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Core protection' }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      coreMode === 'strict'
+                        ? 'Strict: detected Core tampering is blocked unless you explicitly allow that exact commit SHA.'
+                        : coreMode === 'off'
+                          ? 'Off: Mender allows Core tampering. Hermes native malware scanning and capability consent remain separate and active.'
+                          : 'Smart: detected Core tampering pauses and asks. Approval is stored only for that exact plugin + commit SHA.'
+                  })
+                ]
+              }),
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: ['smart', 'strict', 'off'].map(option =>
+                  jsx(Button, {
+                    size: 'sm',
+                    variant: 'outline',
+                    onClick: () => setCoreProtectionMode(option),
+                    children: (coreMode === option ? '✓ ' : '') + option[0].toUpperCase() + option.slice(1)
+                  }, option)
+                )
+              })
+            ]
+          }),
+          Object.keys(approvals || {}).length
+            ? jsxs('div', {
+                className: 'flex flex-col gap-1',
+                children: [
+                  jsx('div', {
+                    className: 'text-xs font-medium text-(--ui-text-secondary)',
+                    children: 'Exact-version Core exceptions'
+                  }),
+                  ...Object.entries(approvals || {}).map(([key, approval]) =>
+                    jsxs('div', {
+                      className: 'flex items-center justify-between gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                      children: [
+                        jsxs('div', {
+                          className: 'min-w-0',
+                          children: [
+                            jsx('div', { className: 'truncate font-medium', children: approval.identity }),
+                            jsx('div', {
+                              className: 'text-xs text-(--ui-text-tertiary)',
+                              children: 'SHA ' + String(approval.sha || '').slice(0, 12) + ' · does not carry to updates'
+                            })
+                          ]
+                        }),
+                        jsx(Button, {
+                          size: 'xs',
+                          variant: 'outline',
+                          onClick: () => {
+                            setCoreVersionApproval(approval.identity, approval.sha, false)
+                            void reconcile('core-approval-revoked')
+                          },
+                          children: 'Revoke'
+                        })
+                      ]
+                    }, key)
+                  )
+                ]
+              })
+            : null
+        ]
+      }),
+
+      jsxs('section', {
+        className: 'flex flex-col gap-2',
+        children: [
           jsx('div', { className: 'font-medium', children: 'Repair behavior' }),
           jsx(PreferenceRow, {
             title: 'Respect uninstall actions',
@@ -1247,117 +1981,293 @@ function MenderPage() {
         ]
       }),
 
+      jsxs('section', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'font-medium', children: 'Install from GitHub' }),
+          jsx('div', {
+            className: 'text-xs text-(--ui-text-tertiary)',
+            children:
+              'Public GitHub repositories only. Mender resolves an exact commit SHA, checks it, then uses Hermes install APIs with force disabled.'
+          }),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('input', {
+                value: installValue,
+                disabled: busy,
+                spellCheck: false,
+                placeholder: 'https://github.com/owner/repo or owner/repo#subdir',
+                className:
+                  'min-w-0 flex-1 rounded-md border border-(--ui-stroke-secondary) bg-transparent px-3 py-2 outline-none',
+                onChange: event => {
+                  installIdentifier.set(String(event?.target?.value || ''))
+                  installState.set({
+                    status: 'idle',
+                    message: '',
+                    identity: null,
+                    sha: null,
+                    probe: null,
+                    canApproveCore: false
+                  })
+                }
+              }),
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: busy || !String(installValue || '').trim(),
+                onClick: () => void installFromInput(),
+                children: busy ? 'Checking…' : 'Install'
+              })
+            ]
+          }),
+          jsx(PreferenceRow, {
+            title: 'Enable after install',
+            description:
+              'Off by default. The Agent half is installed disabled; turn this on only when you want Hermes to activate it immediately after all checks pass.',
+            value: enableAfterInstall,
+            disabled: busy,
+            onChange: value => installEnableAfter.set(Boolean(value))
+          }),
+          install.message
+            ? jsxs('div', {
+                className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                children: [
+                  jsx('div', {
+                    className:
+                      install.status === 'error' || install.status === 'security-blocked' || install.status === 'core-blocked'
+                        ? 'text-red-400'
+                        : install.status === 'core-review-required'
+                          ? 'text-orange-400'
+                          : 'text-(--ui-text-secondary)',
+                    children: install.message
+                  }),
+                  install.probe
+                    ? jsx('div', {
+                        className: 'mt-1 text-xs text-(--ui-text-tertiary)',
+                        children:
+                          'Detected: ' +
+                          (install.probe.agent ? 'Agent ✓' : 'Agent —') +
+                          ' · ' +
+                          (install.probe.desktop ? 'Desktop ✓' : 'Desktop —') +
+                          (install.sha ? ' · SHA ' + String(install.sha).slice(0, 12) : '')
+                      })
+                    : null,
+                  install.canApproveCore && install.identity && install.sha
+                    ? jsx(Button, {
+                        size: 'sm',
+                        variant: 'outline',
+                        className: 'mt-2',
+                        disabled: busy,
+                        onClick: () => applyCoreApproval(install.identity, install.sha, 'install'),
+                        children: 'Allow this exact version'
+                      })
+                    : null
+                ]
+              })
+            : null
+        ]
+      }),
+
       jsxs('div', {
         className: 'grid grid-cols-4 gap-2',
         children: [
           jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Missing: ' + state.missing }),
           jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Blocked now: ' + blockedNow }),
-          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Critical signals: ' + counts.critical }),
-          jsx('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-3', children: 'Advisory signals: ' + advisory })
+          jsx('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            children: 'Security signals: ' + securityFindings.length + (securityCounts.critical ? ' · critical ' + securityCounts.critical : '')
+          }),
+          jsx('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            children: 'Core signals: ' + coreFindings.length + (coreCounts.critical ? ' · critical ' + coreCounts.critical : '')
+          })
         ]
       }),
 
-      jsxs('section', {
-        className: 'flex flex-col gap-2',
+      jsxs('div', {
+        className: 'grid grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]',
         children: [
-          jsx('div', { className: 'font-medium', children: 'Plugin halves' }),
-          state.halves.length
-            ? jsx('div', {
-                className: 'flex flex-col gap-1',
-                children: state.halves.map(item =>
-                  jsxs('div', {
-                    className: 'grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
-                    children: [
+          jsxs('section', {
+            className: 'flex min-w-0 flex-col gap-2',
+            children: [
+              jsx('div', { className: 'font-medium', children: 'Plugin halves' }),
+              state.halves.length
+                ? jsx('div', {
+                    className: 'flex flex-col gap-1',
+                    children: state.halves.map(item =>
                       jsxs('div', {
+                        className: 'grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
                         children: [
-                          jsx('div', { className: 'font-medium', children: item.catalog }),
-                          jsx('div', {
-                            className: 'text-xs text-(--ui-text-tertiary)',
-                            children: item.sha ? item.agentStatus + ' · ' + String(item.sha).slice(0, 8) : item.agentStatus
+                          jsxs('div', {
+                            className: 'min-w-0',
+                            children: [
+                              jsx('div', { className: 'truncate font-medium', children: item.catalog }),
+                              jsx('div', {
+                                className: 'truncate text-xs text-(--ui-text-tertiary)',
+                                children: item.sha ? item.agentStatus + ' · ' + String(item.sha).slice(0, 8) : item.agentStatus
+                              })
+                            ]
+                          }),
+                          jsx('span', {
+                            children:
+                              item.agentExpected === false
+                                ? 'Agent —'
+                                : item.agent
+                                  ? 'Agent ✓'
+                                  : item.agentExpected === true
+                                    ? 'Agent ✕'
+                                    : 'Agent ?'
+                          }),
+                          jsx('span', {
+                            children:
+                              item.desktopExpected === false
+                                ? 'Desktop —'
+                                : item.desktop
+                                  ? 'Desktop ✓'
+                                  : item.desktopExpected === true
+                                    ? 'Desktop ✕'
+                                    : 'Desktop ?'
+                          }),
+                          jsxs('div', {
+                            className: 'flex items-center gap-1',
+                            children: [
+                              item.agent &&
+                              item.agentStatus !== 'enabled' &&
+                              item.agentKey
+                                ? jsx(Button, {
+                                    size: 'xs',
+                                    variant: 'outline',
+                                    disabled: busy || state.running,
+                                    onClick: () => void setAgentEnabled(item, true),
+                                    children: 'Enable'
+                                  })
+                                : null,
+                              jsx(Button, {
+                                size: 'xs',
+                                variant: 'outline',
+                                disabled: busy || state.running,
+                                onClick: () => void uninstallPlugin(item),
+                                children: 'Uninstall'
+                              })
+                            ]
                           })
                         ]
-                      }),
-                      jsx('span', {
-                        children:
-                          item.agentExpected === false
-                            ? 'Agent —'
-                            : item.agent
-                              ? 'Agent ✓'
-                              : item.agentExpected === true
-                                ? 'Agent ✕'
-                                : 'Agent ?'
-                      }),
-                      jsx('span', {
-                        children:
-                          item.desktopExpected === false
-                            ? 'Desktop —'
-                            : item.desktop
-                              ? 'Desktop ✓'
-                              : item.desktopExpected === true
-                                ? 'Desktop ✕'
-                                : 'Desktop ?'
-                      }),
-                      item.agent &&
-                      item.agentStatus !== 'enabled' &&
-                      item.agentKey
-                        ? jsx(Button, {
-                            size: 'xs',
-                            variant: 'outline',
-                            disabled: busy || state.running,
-                            onClick: () => void setAgentEnabled(item, true),
-                            children: 'Enable'
-                          })
-                        : jsx('span', { className: 'w-14' })
-                    ]
-                  }, item.catalog)
-                )
-              })
-            : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No unified packages detected.' })
-        ]
-      }),
-
-      jsxs('section', {
-        className: 'flex flex-col gap-2',
-        children: [
-          jsx('div', { className: 'font-medium', children: 'Security preflight' }),
-          jsx('div', {
-            className: 'text-xs text-(--ui-text-tertiary)',
-            children:
-              'Critical = block-worthy malware-like signal. High = powerful/risky capability that needs review. Medium = capability/egress signal. Findings are not proof of malware; Hermes Core scan blocks dangerous server installs before placement.'
+                      }, item.catalog)
+                    )
+                  })
+                : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No unified packages detected.' })
+            ]
           }),
-          state.findings.length
-            ? jsx('div', {
-                className: 'flex flex-col gap-1',
-                children: state.findings.slice(0, 40).map((finding, index) =>
-                  jsxs('div', {
-                    className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
-                    children: [
-                      jsx('span', { className: severityClass(finding.severity) + ' font-medium', children: finding.severity.toUpperCase() + ' ' + finding.id }),
-                      jsx('span', { children: ' · ' + finding.plugin + ' · ' + finding.label }),
-                      jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: finding.file + ':' + finding.line })
-                    ]
-                  }, finding.id + '-' + index)
-                )
-              })
-            : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No findings in the current local Desktop plugin sources.' })
-        ]
-      }),
 
-      jsxs('section', {
-        className: 'flex flex-col gap-2',
-        children: [
-          jsx('div', { className: 'font-medium', children: 'Last repair actions' }),
-          state.actions.length
-            ? jsx('div', {
-                className: 'flex flex-col gap-1',
-                children: [...state.actions].reverse().slice(0, 20).map((action, index) =>
+          jsxs('div', {
+            className: 'flex min-w-0 flex-col gap-4',
+            children: [
+              jsxs('section', {
+                className: 'flex flex-col gap-2',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Security preflight' }),
                   jsx('div', {
-                    className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
-                    children: (action.plugin || action.type) + ' · ' + action.type + (action.detail ? ' · ' + action.detail : '')
-                  }, action.type + '-' + index)
-                )
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      'Critical = block-worthy malware-like signal. High = powerful/risky capability that needs review. Medium = capability/egress signal. Findings are not proof of malware; Hermes Core scan blocks dangerous server installs before placement.'
+                  }),
+                  securityFindings.length
+                    ? jsx('div', {
+                        className: 'flex flex-col gap-1',
+                        children: securityFindings.slice(0, 40).map((finding, index) =>
+                          jsxs('div', {
+                            className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                            children: [
+                              jsx('span', { className: severityClass(finding.severity) + ' font-medium', children: finding.severity.toUpperCase() + ' ' + finding.id }),
+                              jsx('span', { children: ' · ' + finding.plugin + ' · ' + finding.label }),
+                              jsx('div', { className: 'break-all text-xs text-(--ui-text-tertiary)', children: finding.file + ':' + finding.line })
+                            ]
+                          }, finding.id + '-' + index)
+                        )
+                      })
+                    : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No findings in the current local Desktop plugin sources.' })
+                ]
+              }),
+
+              jsxs('section', {
+                className: 'flex flex-col gap-2',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Core protection findings' }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      coreMode === 'smart'
+                        ? 'Smart asks before a detected Core change. Exact-version approval is bound to one SHA.'
+                        : coreMode === 'strict'
+                          ? 'Strict blocks detected Core changes unless that exact SHA is explicitly approved.'
+                          : 'Off allows Core changes at the Mender layer; findings remain visible for audit.'
+                  }),
+                  coreFindings.length
+                    ? jsx('div', {
+                        className: 'flex flex-col gap-1',
+                        children: coreFindings.slice(0, 40).map((finding, index) =>
+                          jsxs('div', {
+                            className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                            children: [
+                              jsx('span', {
+                                className: severityClass(finding.severity) + ' font-medium',
+                                children: finding.severity.toUpperCase() + ' ' + finding.id
+                              }),
+                              jsx('span', { children: ' · ' + finding.plugin + ' · ' + finding.label }),
+                              jsx('div', {
+                                className: 'break-all text-xs text-(--ui-text-tertiary)',
+                                children: finding.file + ':' + finding.line
+                              })
+                            ]
+                          }, 'core-' + finding.id + '-' + index)
+                        )
+                      })
+                    : jsx('div', {
+                        className: 'text-(--ui-text-tertiary)',
+                        children: 'No Core-tamper signals in the currently inspected plugin source.'
+                      })
+                ]
+              }),
+
+              jsxs('section', {
+                className: 'flex flex-col gap-2',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Last repair actions' }),
+                  state.actions.length
+                    ? jsx('div', {
+                        className: 'flex flex-col gap-1',
+                        children: [...state.actions].reverse().slice(0, 20).map((action, index) =>
+                          jsxs('div', {
+                            className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                            children: [
+                              jsx('div', {
+                                children: (action.plugin || action.type) + ' · ' + action.type + (action.detail ? ' · ' + action.detail : '')
+                              }),
+                              action.canApproveCore && action.approvalIdentity && action.approvalSha
+                                ? jsx(Button, {
+                                    size: 'xs',
+                                    variant: 'outline',
+                                    className: 'mt-2',
+                                    disabled: busy || state.running,
+                                    onClick: () =>
+                                      applyCoreApproval(
+                                        action.approvalIdentity,
+                                        action.approvalSha,
+                                        action.resume || 'repair'
+                                      ),
+                                    children: 'Allow this exact version'
+                                  })
+                                : null
+                            ]
+                          }, action.type + '-' + index)
+                        )
+                      })
+                    : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No repair actions in the last run.' })
+                ]
               })
-            : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No repair actions in the last run.' })
+            ]
+          })
         ]
       }),
 
@@ -1390,6 +2300,10 @@ const plugin = {
     pluginStorage = ctx.storage
     const savedMode = ctx.storage.get('security.mode', 'smart')
     securityMode.set(SECURITY_MODES.has(savedMode) ? savedMode : 'smart')
+    const savedCoreMode = ctx.storage.get('coreProtection.mode', 'smart')
+    coreProtectionMode.set(CORE_PROTECTION_MODES.has(savedCoreMode) ? savedCoreMode : 'smart')
+    const savedApprovals = ctx.storage.get('coreProtection.approvals', {})
+    coreVersionApprovals.set(savedApprovals && typeof savedApprovals === 'object' ? savedApprovals : {})
     respectUninstallIntent.set(Boolean(ctx.storage.get('repair.respectUninstallIntent', true)))
     autoEnableRepairedAgents.set(Boolean(ctx.storage.get('repair.autoEnableAgents', false)))
 
@@ -1451,4 +2365,4 @@ const plugin = {
 }
 
 export default plugin
-export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile }
+export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, scanCoreTamperSource, hasCoreProtectionBlocker, runPreflight, preflightDecision, coreApprovalKey, setCoreVersionApproval, isCoreVersionApproved, parseGitHubInstallIdentifier, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile, safeCliPluginName }

@@ -54,6 +54,41 @@ Mender keeps repair controls in one place:
 - Installed-but-disabled Agent halves show an **Enable** action directly in the Mender row.
 - **Update all** updates every supported catalog-installed package through one controller. Agent/unified packages use `plugins.manage update`; capability-widening updates stop at **Review required** instead of auto-consenting. Desktop-only catalog packages are compared against the pinned catalog files, scanned, then updated in place without creating a duplicate installation.
 
+## Remote uninstall compatibility
+
+Mender exposes **Uninstall** on each managed package row. It first uses the current `plugins.manage remove` RPC. If an older remote gateway responds specifically with `unknown plugins action: remove`, Mender falls back to the official `hermes plugins remove <name>` CLI through Hermes' own gateway shell RPC. The fallback accepts only a strict canonical plugin-name character set and then removes the local Desktop half as part of the same operation.
+
+This compatibility path exists for Desktop/gateway contract skew; it is not a second package manager.
+
+## Core protection
+
+Core protection is separate from the general security preflight and has intentionally different mode semantics:
+
+- **Smart** (default): detected Core tampering pauses the Mender-controlled install/repair/update and asks for a decision.
+- **Strict**: detected Core tampering is blocked by default.
+- **Off**: Mender allows Core tampering. Hermes' native malware scan and capability consent remain separate and active.
+
+When Smart pauses, or when a user intentionally wants one Core-changing plugin despite Strict, Mender can store **Allow this exact version**. The exception is bound to the plugin identity plus the full 40-character commit SHA, is visible/revocable in the UI, and does not carry to a future update.
+
+A Core exception never bypasses the normal Security mode. A general malware/secret security block has no Core-override button.
+
+Supported Hermes extension capabilities such as `tools.override` and `llm.model_override` are not treated as Core tampering by themselves.
+
+## Install from GitHub
+
+Mender includes a checked installer for **public GitHub repositories**. Paste a GitHub URL or `owner/repo` (optionally a package subdirectory), then choose whether the Agent half should be enabled after installation.
+
+The flow:
+
+1. resolve the public repository/ref to a full Git commit SHA;
+2. ask Hermes' own `probePluginRepo` which plugin halves exist;
+3. inspect the pinned source with Mender Security + Core protection;
+4. install the Agent half through `plugins.manage install` with `ref: <full SHA>` and `force: false`;
+5. install the Desktop half through the Hermes Desktop bridge, then reconcile its files to the same checked SHA;
+6. never create a second copy merely to update/repair an existing destination.
+
+**Enable after install** defaults to Off. Private repositories should use Hermes' normal installer because Hermes deliberately keeps its Git credential handling out of third-party Desktop plugins.
+
 ## Security preflight
 
 Before Mender automatically materializes a missing half, it performs bounded static inspection of the source it is about to use.

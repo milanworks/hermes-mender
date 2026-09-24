@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0-dev
+
+- Change Core protection semantics to Smart = ask, Strict = block, Off = allow at the Mender layer.
+- Add revocable Core-protection exceptions bound to exact plugin identity + full commit SHA.
+- Keep Core-protection exceptions separate from the normal Security mode; they cannot override a general Security block.
+- Add checked public-GitHub installation from URL or owner/repo, including optional subdirectory.
+- Add separate **Enable after install** control; default remains Off.
+- Resolve GitHub installs to immutable SHAs, run Hermes repo probing plus Mender preflight, and use `force: false`.
+- Keep GitHub private-repository credentials outside Mender; private repos use Hermes' normal installer.
+- Live-verify remote uninstall intent with `hermes-rss`: both halves removed, no automatic reinstall, Missing stayed 0; then restore the original RSS state.
+- Keep Plugin halves on the left and Security/Recent actions on the right on wide layouts.
+
+
+## 0.5.0-dev
+
+- Add independent Core protection modes: Smart / Strict / Off.
+- Smart blocks high-confidence Hermes install-tree/runtime tamper while showing weaker internal coupling for review.
+- Strict also blocks high-risk internal mutation/patch signals.
+- Apply Core protection to repairs and checked Desktop-only updates without treating supported Hermes override APIs as tampering.
+- Split the desktop layout: Plugin halves on the left; Security preflight and recent actions on the right.
+- Keep Hermes native install scanning/capability consent active regardless of Mender Core-protection mode.
+- Add compatibility Uninstall: new remove RPC first, official CLI fallback only for older gateways that reject that exact action.
+- Run Mender security/Core preflight before Agent/unified Update all re-pins as well as before Desktop-only updates.
+
+
 ## 0.4.0-dev
 
 - Add UI toggle for intentional-uninstall protection.
