@@ -5,13 +5,20 @@
  * is connected to a remote gateway. Uses the backend's installed SHA, never branch
  * HEAD, and never force-replaces an existing Desktop plugin.
  */
-import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_AREA } from '@hermes/plugin-sdk'
+import { host, atom, useValue, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_AREA } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
 const VERSION = '0.7.0-dev'
-const CHECK_MS = 20000
+const AUTO_REPAIR_FALLBACK_MS = 5 * 60 * 1000
+const DEFAULT_REPAIR_INTERVAL_SECONDS = 60
+const REPAIR_INTERVAL_OPTIONS = [15, 30, 60, 300, 900, 1800]
+const AUTO_UPDATE_CHECK_FALLBACK_MS = 6 * 60 * 60 * 1000
+const DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
+const UPDATE_CHECK_INTERVAL_OPTIONS = [900, 3600, 21600, 43200, 86400]
+const MENDER_REPOSITORY = 'milanworks/hermes-mender'
 let timer = null
+let updateTimer = null
 let running = false
 let lastRun = null
 let directoryWatchId = null
@@ -19,14 +26,31 @@ let stopDirectoryEvents = null
 const probeCache = new Map()
 const SECURITY_MODES = new Set(['smart', 'strict', 'off'])
 const CORE_PROTECTION_MODES = new Set(['smart', 'strict', 'off'])
+const REPAIR_SCHEDULE_MODES = new Set(['auto', 'interval', 'off'])
+const UPDATE_CHECK_MODES = new Set(['auto', 'interval', 'off'])
 const securityMode = atom('smart')
 const coreProtectionMode = atom('smart')
 const coreVersionApprovals = atom({})
 const respectUninstallIntent = atom(true)
 const autoEnableRepairedAgents = atom(false)
+const repairScheduleMode = atom('auto')
+const repairIntervalSeconds = atom(DEFAULT_REPAIR_INTERVAL_SECONDS)
+const updateCheckMode = atom('auto')
+const updateCheckIntervalSeconds = atom(DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS)
+const updatePlanState = atom({
+  status: 'idle',
+  checkedAt: null,
+  items: [],
+  error: null
+})
+const updateReviewState = atom({
+  open: false,
+  keys: []
+})
 const operationBusy = atom(false)
+const uninstallConfirmItem = atom(null)
 const installIdentifier = atom('')
-const installEnableAfter = atom(false)
+const installEnableAfterDefault = atom(false)
 const installState = atom({
   status: 'idle',
   message: '',
@@ -34,7 +58,8 @@ const installState = atom({
   sha: null,
   probe: null,
   canApproveCore: false,
-  reviewFindings: []
+  reviewFindings: [],
+  enableAfter: false
 })
 const compatibilityState = atom({
   status: 'checking',
@@ -116,7 +141,7 @@ async function checkCompatibility(force = false) {
     'native directory watch',
     typeof desktop?.watchDirectory === 'function' && typeof desktop?.onPreviewFileChanged === 'function',
     false,
-    'The 20-second reconcile timer remains as fallback.'
+    'Automatic repair can use native events, a periodic interval, or be turned off.'
   )
   add(
     'desktop.reconcile',
@@ -252,6 +277,8 @@ const SECURITY_RULES = [
   { id: 'MND103', severity: 'high', label: 'process execution library', re: /\b(?:child_process|subprocess|os\.system)\b/g },
   { id: 'MND104', severity: 'high', label: 'desktop file mutation', re: /\.(?:writeTextFile|trashPath|removeDesktopPlugin|renamePath)\s*\(/g },
   { id: 'MND105', severity: 'high', label: 'desktop plugin installation', re: /\.installDesktopPlugin\s*\(/g },
+  { id: 'MND106', severity: 'high', label: 'computed dynamic module loading', re: /(?:\bimport\s*\(\s*(?!["'`])|\bimportlib\.import_module\s*\(\s*(?!["'])|\b__import__\s*\(\s*(?!["']))/g },
+  { id: 'MND107', severity: 'high', label: 'obfuscated runtime decode chain', re: /(?:\batob\s*\(|Buffer\.from\s*\([^\n]{0,200}["']base64["']|base64\.b64decode\s*\()[\s\S]{0,500}?(?:\beval\s*\(|\bnew\s+Function\s*\(|\bexec\s*\()/g },
   { id: 'MND201', severity: 'medium', label: 'network request', re: /\b(?:fetch|WebSocket|requests|httpx|aiohttp)\b/g },
   { id: 'MND202', severity: 'medium', label: 'environment access', re: /\b(?:process\.env|os\.environ|getenv)\b/g },
   { id: 'MND203', severity: 'medium', label: 'clipboard access', re: /\.(?:readClipboard|writeClipboard)\s*\(/g },
@@ -260,6 +287,47 @@ const SECURITY_RULES = [
 
 function lineForOffset(source, offset) {
   return String(source).slice(0, Math.max(0, offset)).split('\n').length
+}
+
+function dependencyMetadataFindings(source, file = 'plugin.js') {
+  const text = String(source || '')
+  const normalized = String(file || '').replace(/\\/g, '/').toLowerCase()
+  const findings = []
+  const push = (id, severity, label, index = 0) => findings.push({
+    id,
+    severity,
+    label,
+    file,
+    line: lineForOffset(text, Math.max(0, index))
+  })
+
+  const isPackageJson = normalized.endsWith('/package.json') || normalized === 'package.json'
+  const isRequirements = /(^|\/)requirements[^/]*\.txt$/.test(normalized)
+  const isPyproject = normalized.endsWith('/pyproject.toml') || normalized === 'pyproject.toml'
+  if (!isPackageJson && !isRequirements && !isPyproject) return findings
+
+  const remoteSpec = /(?:git\+https?:\/\/|git\+ssh:\/\/|https?:\/\/[^\s"'<>]+\.(?:git|whl|zip|tar\.gz)|github:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/ig
+  let match
+  while ((match = remoteSpec.exec(text)) && findings.length < 20) {
+    const around = text.slice(match.index, Math.min(text.length, match.index + 260))
+    const immutable =
+      /@[0-9a-f]{40}(?:\b|[#?])/i.test(around) ||
+      /#[0-9a-f]{40}(?:\b|[?&])/i.test(around)
+    push(
+      immutable ? 'MND302' : 'MND301',
+      immutable ? 'medium' : 'high',
+      immutable ? 'remote dependency pinned to an immutable commit' : 'mutable remote dependency source',
+      match.index
+    )
+    if (!match[0].length) remoteSpec.lastIndex += 1
+  }
+
+  if (isPackageJson) {
+    const lifecycle = text.match(/"(?:preinstall|install|postinstall)"\s*:\s*"[^"]*(?:curl|wget|powershell|pwsh|Invoke-WebRequest|child_process|node\s+-e|sh\s+-c)/i)
+    if (lifecycle) push('MND303', 'high', 'install lifecycle script executes an external command', lifecycle.index ?? 0)
+  }
+
+  return findings
 }
 
 function scanSource(source, file = 'plugin.js') {
@@ -281,6 +349,10 @@ function scanSource(source, file = 'plugin.js') {
     }
   }
 
+  if (findings.length < 60) {
+    findings.push(...dependencyMetadataFindings(text, file).slice(0, 60 - findings.length))
+  }
+
   return findings
 }
 
@@ -295,8 +367,9 @@ function hasBlockingFinding(findings, mode = securityMode.get()) {
 const CORE_PATH_RE = /(?:\/usr\/local\/lib\/hermes-agent|[\\/]hermes-agent[\\/](?:hermes_cli|agent|tools|gateway|tui_gateway|apps[\\/]desktop)|site-packages[\\/](?:hermes_cli|agent|tools|gateway|tui_gateway))/i
 const CORE_MUTATION_RE = /(?:write_text|write_bytes|open\s*\([^\n]{0,80}["'](?:w|a|x)[+b]?|unlink\s*\(|remove\s*\(|rmtree\s*\(|rename\s*\(|replace\s*\(|copy(?:file|tree)?\s*\(|move\s*\(|git\s+(?:apply|checkout|reset)|patch\s+-p|sed\s+-i)/i
 const CORE_INTERNAL_IMPORT_RE = /^\s*(?:from|import)\s+(?:hermes_cli|gateway|tui_gateway|agent|tools)(?:\.|\s|$)/m
-const CORE_RUNTIME_PATCH_RE = /(?:sys\.modules\s*\[[^\]]*(?:hermes_cli|gateway|tui_gateway|agent|tools)[^\]]*\]\s*=|setattr\s*\([^\n]{0,120}(?:hermes_cli|gateway|tui_gateway|agent|tools)|mock\.patch(?:\.object)?\s*\([^\n]{0,120}(?:hermes_cli|gateway|tui_gateway|agent|tools))/i
-const CORE_ENV_MUTATION_RE = /(?:sys\.executable[^\n]{0,160}-m\s+pip\s+install|(?:pip|uv\s+pip)\s+install[^\n]{0,180}(?:site-packages|hermes-agent|hermes_cli))/i
+const CORE_PATCH_BEHAVIOR_RE = /(?:\bmonkeypatch\b|\bmock\.patch(?:\.object)?\s*\(|\bpatch\.object\s*\(|\bsetattr\s*\(|sys\.modules\s*\[[^\]]+\]\s*=)/i
+const CORE_RUNTIME_PATCH_RE = /(?:sys\.modules\s*\[[^\]]*["'](?:hermes_cli|gateway|tui_gateway|agent|tools)(?:\.|["'])[^\]]*\]\s*=|(?:mock\.patch|patch)\s*\(\s*["'](?:hermes_cli|gateway|tui_gateway|agent|tools)\.|setattr\s*\(\s*(?:hermes_cli|gateway|tui_gateway|agent|tools)\b)/i
+const CORE_ENV_MUTATION_RE = /(?:(?:python(?:3)?|sys\.executable)[^\n]{0,160}-m\s+pip\s+(?:install|uninstall)[^\n]{0,180}(?:hermes-agent|hermes_cli|\/usr\/local\/lib\/hermes-agent)|(?:pip|uv\s+pip)\s+(?:install|uninstall)[^\n]{0,180}(?:site-packages|hermes-agent|hermes_cli|\/usr\/local\/lib\/hermes-agent))/i
 
 function scanCoreTamperSource(source, file = 'plugin.js') {
   const text = String(source || '')
@@ -333,7 +406,7 @@ function scanCoreTamperSource(source, file = 'plugin.js') {
   }
 
   const internalImport = text.match(CORE_INTERNAL_IMPORT_RE)
-  if (internalImport && (mutationMatch || /(?:monkeypatch|patch\.object|mock\.patch)/i.test(text))) {
+  if (internalImport && (mutationMatch || CORE_PATCH_BEHAVIOR_RE.test(text))) {
     push('CORE101', 'high', 'internal Hermes import combined with mutation/patch behavior', internalImport.index ?? 0)
   } else if (internalImport) {
     push('CORE102', 'medium', 'direct dependency on Hermes internal module', internalImport.index ?? 0)
@@ -447,9 +520,9 @@ function applyCoreApproval(identity, sha, resume = 'repair') {
   if (resume === 'update') {
     void updateAllPlugins()
   } else if (resume === 'install') {
-    void installFromInput()
+    void installFromInput(Boolean(installState.get()?.enableAfter))
   } else {
-    void reconcile('core-approval')
+    void reconcile('core-approval', { mutate: true })
   }
 }
 
@@ -457,21 +530,161 @@ function setSecurityMode(mode) {
   const next = SECURITY_MODES.has(mode) ? mode : 'smart'
   securityMode.set(next)
   pluginStorage?.set('security.mode', next)
-  void reconcile('security-mode')
+  void reconcile('security-mode', { mutate: false })
 }
 
 function setCoreProtectionMode(mode) {
   const next = CORE_PROTECTION_MODES.has(mode) ? mode : 'smart'
   coreProtectionMode.set(next)
   pluginStorage?.set('coreProtection.mode', next)
-  void reconcile('core-protection-mode')
+  void reconcile('core-protection-mode', { mutate: false })
 }
 
 function setBooleanPreference(key, target, value) {
   const next = Boolean(value)
   target.set(next)
   pluginStorage?.set(key, next)
-  void reconcile('preference-change')
+  void reconcile('preference-change', { mutate: false })
+}
+
+function normalizeRepairIntervalSeconds(value) {
+  const parsed = Math.round(Number(value))
+  if (!Number.isFinite(parsed)) return DEFAULT_REPAIR_INTERVAL_SECONDS
+  return Math.max(10, Math.min(3600, parsed))
+}
+
+function repairTimerDelayMs(mode = repairScheduleMode.get(), seconds = repairIntervalSeconds.get()) {
+  if (mode === 'off') return null
+  if (mode === 'interval') return normalizeRepairIntervalSeconds(seconds) * 1000
+  return AUTO_REPAIR_FALLBACK_MS
+}
+
+function configureRepairTimer() {
+  if (timer) clearInterval(timer)
+  timer = null
+
+  const mode = repairScheduleMode.get()
+  const delay = repairTimerDelayMs(mode, repairIntervalSeconds.get())
+  if (!delay) return
+
+  timer = setInterval(() => {
+    if (operationBusy.get()) return
+    void reconcile(mode === 'interval' ? 'interval' : 'auto-fallback', { mutate: true })
+  }, delay)
+}
+
+function setRepairScheduleMode(mode) {
+  const next = REPAIR_SCHEDULE_MODES.has(mode) ? mode : 'auto'
+  repairScheduleMode.set(next)
+  pluginStorage?.set('repair.scheduleMode', next)
+  configureRepairTimer()
+  void reconcile('repair-schedule-change', { mutate: false })
+}
+
+function setRepairIntervalSeconds(value) {
+  const next = normalizeRepairIntervalSeconds(value)
+  repairIntervalSeconds.set(next)
+  pluginStorage?.set('repair.intervalSeconds', next)
+  if (repairScheduleMode.get() === 'interval') configureRepairTimer()
+}
+
+function isAutomaticRepairReason(reason) {
+  return ['startup', 'connection-applied', 'directory-change', 'auto-fallback', 'interval'].includes(String(reason || ''))
+}
+
+function normalizeUpdateCheckIntervalSeconds(value) {
+  const parsed = Math.round(Number(value))
+  if (!Number.isFinite(parsed)) return DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS
+  return Math.max(300, Math.min(7 * 24 * 60 * 60, parsed))
+}
+
+function updateCheckTimerDelayMs(mode = updateCheckMode.get(), seconds = updateCheckIntervalSeconds.get()) {
+  if (mode === 'off') return null
+  if (mode === 'interval') return normalizeUpdateCheckIntervalSeconds(seconds) * 1000
+  return AUTO_UPDATE_CHECK_FALLBACK_MS
+}
+
+function configureUpdateCheckTimer() {
+  if (updateTimer) clearInterval(updateTimer)
+  updateTimer = null
+
+  const mode = updateCheckMode.get()
+  const delay = updateCheckTimerDelayMs(mode, updateCheckIntervalSeconds.get())
+  if (!delay) return
+
+  updateTimer = setInterval(() => {
+    if (operationBusy.get() || updatePlanState.get()?.status === 'checking') return
+    void checkForUpdates(mode === 'interval' ? 'interval' : 'auto-fallback')
+  }, delay)
+}
+
+function setUpdateCheckMode(mode) {
+  const next = UPDATE_CHECK_MODES.has(mode) ? mode : 'auto'
+  updateCheckMode.set(next)
+  pluginStorage?.set('updates.checkMode', next)
+  configureUpdateCheckTimer()
+  if (next !== 'off') void checkForUpdates('policy-change')
+}
+
+function setUpdateCheckIntervalSeconds(value) {
+  const next = normalizeUpdateCheckIntervalSeconds(value)
+  updateCheckIntervalSeconds.set(next)
+  pluginStorage?.set('updates.intervalSeconds', next)
+  if (updateCheckMode.get() === 'interval') configureUpdateCheckTimer()
+}
+
+function parseVersionParts(value) {
+  const match = String(value || '').trim().match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/)
+  if (!match) return null
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] || ''
+  }
+}
+
+function compareVersions(a, b) {
+  const left = parseVersionParts(a)
+  const right = parseVersionParts(b)
+  if (!left || !right) return String(a || '').localeCompare(String(b || ''))
+
+  for (const key of ['major', 'minor', 'patch']) {
+    if (left[key] !== right[key]) return left[key] > right[key] ? 1 : -1
+  }
+
+  if (left.prerelease === right.prerelease) return 0
+  if (!left.prerelease) return 1
+  if (!right.prerelease) return -1
+  return left.prerelease.localeCompare(right.prerelease)
+}
+
+function updateItemKey(item) {
+  const kind = String(item?.kind || 'plugin')
+  const identity = String(item?.identity || item?.plugin || item?.name || '').trim().toLowerCase()
+  const target = String(item?.targetSha || item?.targetVersion || '').trim().toLowerCase()
+  return kind + ':' + identity + '@' + target
+}
+
+function dedupeUpdateItems(items) {
+  const unique = new Map()
+  for (const item of items || []) {
+    if (!item) continue
+    const key = updateItemKey(item)
+    if (!key || key === 'plugin:@') continue
+    unique.set(key, { ...item, key })
+  }
+  return [...unique.values()]
+}
+
+function isUpdateItemApplicable(item) {
+  return Boolean(item && item.status === 'available' && !item.blocked)
+}
+
+function isHermesScannerBlockedResult(result) {
+  if (result?.scan_blocked === true) return true
+  const message = String(result?.error || '')
+  return /security scan blocked plugin install|plugin guard.+blocked|dangerous.+blocked|scan.+blocked/i.test(message)
 }
 
 function riskCounts(findings) {
@@ -502,7 +715,7 @@ async function localPluginInventory(desktop, root) {
       const file = joinPath(entry.path, 'plugin.js')
       const source = await readPluginText(desktop, file)
       const id = extractPluginId(source)
-      if (id) byId.set(id, { folder: entry.name, path: entry.path, source })
+      if (id) byId.set(id, { id, folder: entry.name, path: entry.path, source })
     } catch {
       // A non-plugin folder or a file mid-write is ignored until the next pass.
     }
@@ -1147,12 +1360,35 @@ async function buildHalfRows(desktop, rows, inventory, catalog) {
   const seen = new Set()
 
   for (const row of rows) {
-    if (!row?.has_desktop_half || !row?.catalog_name) continue
+    if (!row) continue
 
-    const local = inventory.byId.get(row.name) || inventory.byId.get(row.catalog_name) || null
+    const packageName = String(row.catalog_name || row.name || '').trim()
+    if (!packageName) continue
+
+    if (!row.has_desktop_half) {
+      if (String(row.source || '').toLowerCase() !== 'git') continue
+      result.push({
+        catalog: packageName,
+        agentExpected: true,
+        desktopExpected: false,
+        agent: true,
+        agentName: row.name || row.catalog_name,
+        agentKey: row.key || null,
+        agentStatus: row.status || 'installed',
+        updateAvailable: Boolean(row.update_available),
+        desktop: false,
+        desktopId: null,
+        desktopPath: null,
+        sha: row.installed_sha || row.pinned_sha || null
+      })
+      seen.add(packageName)
+      continue
+    }
+
+    const local = inventory.byId.get(row.name) || inventory.byId.get(row.catalog_name) || inventory.byId.get(packageName) || null
 
     result.push({
-      catalog: row.catalog_name,
+      catalog: packageName,
       agentExpected: true,
       desktopExpected: true,
       agent: true,
@@ -1165,7 +1401,7 @@ async function buildHalfRows(desktop, rows, inventory, catalog) {
       desktopPath: local?.path || null,
       sha: row.installed_sha || row.pinned_sha || null
     })
-    seen.add(row.catalog_name)
+    seen.add(packageName)
   }
 
   for (const local of inventory.byId.values()) {
@@ -1193,8 +1429,12 @@ async function buildHalfRows(desktop, rows, inventory, catalog) {
   return result.sort((a, b) => a.catalog.localeCompare(b.catalog))
 }
 
-async function reconcile(reason = 'timer') {
+async function reconcile(reason = 'timer', options = {}) {
   if (running) return lastRun
+  if (operationBusy.get() && isAutomaticRepairReason(reason)) return lastRun
+
+  const mutate = options.mutate !== false
+  const visible = options.visible === true || reason === 'manual'
   running = true
 
   const report = {
@@ -1210,7 +1450,7 @@ async function reconcile(reason = 'timer') {
 
   let desktop = null
   let root = null
-  menderState.set({ ...menderState.get(), running: true, reason, error: null })
+  menderState.set({ ...menderState.get(), running: visible, reason, error: null })
 
   try {
     const compatibility = await checkCompatibility(reason === 'startup' || reason === 'connection-applied')
@@ -1235,30 +1475,33 @@ async function reconcile(reason = 'timer') {
     }
 
     root = await desktop.desktopPluginsRoot()
-    await repairCatalogFolder(desktop, root)
+    if (mutate) await repairCatalogFolder(desktop, root)
 
     const catalog = await readCatalog(desktop, root)
     const initial = await host.request('plugins.manage', { action: 'list' })
     const initialRows = Array.isArray(initial?.plugins) ? initial.plugins : []
     let inventory = await localPluginInventory(desktop, root)
-    const initialHalves = await buildHalfRows(desktop, initialRows, inventory, catalog)
-    const uninstallTombstones = await syncIntentionalAgentRemovals(
-      desktop,
-      initialHalves,
-      inventory,
-      report,
-      reason
-    )
 
-    report.installed = await ensureRemoteDesktopHalves(desktop, root, report)
-    await ensureAgentHalves(desktop, root, report, uninstallTombstones)
+    if (mutate) {
+      const initialHalves = await buildHalfRows(desktop, initialRows, inventory, catalog)
+      const uninstallTombstones = await syncIntentionalAgentRemovals(
+        desktop,
+        initialHalves,
+        inventory,
+        report,
+        reason
+      )
 
-    const latest = await host.request('plugins.manage', { action: 'list' })
+      report.installed = await ensureRemoteDesktopHalves(desktop, root, report)
+      await ensureAgentHalves(desktop, root, report, uninstallTombstones)
+    }
+
+    const latest = mutate ? await host.request('plugins.manage', { action: 'list' }) : initial
     const rows = Array.isArray(latest?.plugins) ? latest.plugins : []
     inventory = await localPluginInventory(desktop, root)
 
     report.halves = await buildHalfRows(desktop, rows, inventory, catalog)
-    writePackageSnapshot(report.halves)
+    if (mutate) writePackageSnapshot(report.halves)
 
     if (securityMode.get() !== 'off' || coreProtectionMode.get() !== 'off') {
       for (const local of inventory.byId.values()) {
@@ -1346,12 +1589,6 @@ function seedUninstallTombstone(item) {
 
 async function uninstallPlugin(item) {
   if (!item || operationBusy.get()) return
-
-  const confirmed =
-    typeof window.confirm !== 'function' ||
-    window.confirm('Remove ' + item.catalog + '? Mender will remove every installed half it manages for this package.')
-
-  if (!confirmed) return
 
   operationBusy.set(true)
   seedUninstallTombstone(item)
@@ -1463,8 +1700,9 @@ function appendFindingsToState(findings, plugin) {
   menderState.set({ ...current, findings: [...unique.values()].slice(0, 160) })
 }
 
-async function installFromInput() {
+async function installFromInput(enableAfter = false) {
   if (operationBusy.get()) return
+  const requestedEnable = Boolean(enableAfter)
   const raw = String(installIdentifier.get() || '').trim()
   if (!raw) {
     installState.set({
@@ -1473,7 +1711,8 @@ async function installFromInput() {
       identity: null,
       sha: null,
       probe: null,
-      canApproveCore: false
+      canApproveCore: false,
+      enableAfter: requestedEnable
     })
     return
   }
@@ -1486,7 +1725,8 @@ async function installFromInput() {
     sha: null,
     probe: null,
     canApproveCore: false,
-    reviewFindings: []
+    reviewFindings: [],
+    enableAfter: requestedEnable
   })
 
   try {
@@ -1499,11 +1739,6 @@ async function installFromInput() {
     const sha = await resolveGitHubInstallSha(target)
     const entry = { repo: target.repoUrl, subdir: target.subdir || null }
 
-    const officialProbe = await desktop.probePluginRepo?.({ identifier: target.identifier })
-    if (!officialProbe?.ok || (!officialProbe.agent && !officialProbe.desktop)) {
-      throw new Error(officialProbe?.error || 'Hermes did not recognize this repository as a plugin.')
-    }
-
     const sourceFiles = await fetchPinnedRuntimeFiles(entry, sha)
     const pinnedHasAgent = sourceFiles.some(file => /(^|\/)plugin\.ya?ml$/i.test(String(file.path || '')))
 
@@ -1515,15 +1750,27 @@ async function installFromInput() {
     }
     const pinnedHasDesktop = desktopFiles.some(file => file.name === 'plugin.js')
 
-    if (
-      Boolean(officialProbe.agent) !== Boolean(pinnedHasAgent) ||
-      Boolean(officialProbe.desktop) !== Boolean(pinnedHasDesktop)
-    ) {
-      throw new Error('Repository changed while being checked. Retry so Hermes and Mender inspect the same plugin shape.')
+    // Hermes' current Desktop probe accepts repo/subdir but no immutable ref.
+    // For an explicit tree/ref URL, probing the default branch would compare the wrong source.
+    // In that case the exact-SHA tree Mender already fetched is the shape authority.
+    let officialProbe = null
+    if (!target.ref) {
+      officialProbe = await desktop.probePluginRepo?.({ identifier: target.identifier })
+      if (!officialProbe?.ok || (!officialProbe.agent && !officialProbe.desktop)) {
+        throw new Error(officialProbe?.error || 'Hermes did not recognize this repository as a plugin.')
+      }
+      if (
+        Boolean(officialProbe.agent) !== Boolean(pinnedHasAgent) ||
+        Boolean(officialProbe.desktop) !== Boolean(pinnedHasDesktop)
+      ) {
+        throw new Error('Repository changed while being checked. Retry so Hermes and Mender inspect the same plugin shape.')
+      }
+    } else if (!pinnedHasAgent && !pinnedHasDesktop) {
+      throw new Error('The requested GitHub ref does not contain a supported Hermes plugin package.')
     }
 
-    const hasAgent = Boolean(officialProbe.agent && pinnedHasAgent)
-    const hasDesktop = Boolean(officialProbe.desktop && pinnedHasDesktop)
+    const hasAgent = Boolean(pinnedHasAgent && (officialProbe ? officialProbe.agent : true))
+    const hasDesktop = Boolean(pinnedHasDesktop && (officialProbe ? officialProbe.desktop : true))
 
     const filesToCheck = [
       ...sourceFiles,
@@ -1546,6 +1793,7 @@ async function installFromInput() {
         sha,
         probe: { agent: hasAgent, desktop: hasDesktop },
         canApproveCore: decision.canApproveCore,
+        enableAfter: requestedEnable,
         reviewFindings: preflight.findings
           .filter(finding => finding.source === 'core-protection')
           .slice(0, 12)
@@ -1554,6 +1802,9 @@ async function installFromInput() {
     }
 
     const outcomes = []
+    let desktopSatisfiedFromAgentPackage = false
+    const expectedDesktopId =
+      hasDesktop ? extractPluginId(desktopFiles.find(file => file.name === 'plugin.js')?.text || '') : null
 
     if (hasAgent) {
       const result = await host.request('plugins.manage', {
@@ -1561,7 +1812,7 @@ async function installFromInput() {
         identifier: target.identifier,
         ref: sha,
         force: false,
-        enable: installEnableAfter.get()
+        enable: requestedEnable
       })
 
       if (!result?.ok) {
@@ -1587,10 +1838,36 @@ async function installFromInput() {
         throw new Error(result?.error || 'Hermes rejected the Agent plugin install.')
       }
 
-      outcomes.push('Agent installed' + (installEnableAfter.get() ? ' + enabled' : ' (disabled)'))
+      if (!requestedEnable) {
+        const canonicalKey = String(result?.plugin_name || '').trim()
+        if (!canonicalKey) throw new Error('Hermes installed the Agent plugin but did not return its canonical plugin key.')
+        const disabled = await host.request('plugins.manage', {
+          action: 'toggle',
+          key: canonicalKey,
+          enable: false
+        })
+        if (!disabled?.ok) {
+          throw new Error(disabled?.error || 'Hermes installed the Agent plugin but could not leave it disabled.')
+        }
+      }
+
+      outcomes.push('Agent installed' + (requestedEnable ? ' + enabled' : ' (disabled)'))
+
+      if (hasDesktop && expectedDesktopId && desktop.reconcileDesktopPlugins && desktop.desktopPluginsRoot) {
+        await desktop.reconcileDesktopPlugins().catch(() => undefined)
+        const root = await desktop.desktopPluginsRoot()
+        const inventory = await localPluginInventory(desktop, root)
+        const materialized = inventory.byId.get(expectedDesktopId)
+
+        if (materialized?.path) {
+          await pinInstalledTree(desktop, materialized.path, desktopFiles)
+          desktopSatisfiedFromAgentPackage = true
+          outcomes.push('Desktop installed')
+        }
+      }
     }
 
-    if (hasDesktop) {
+    if (hasDesktop && !desktopSatisfiedFromAgentPackage) {
       const result = await desktop.installDesktopPlugin({
         identifier: target.identifier,
         force: false
@@ -1602,59 +1879,170 @@ async function installFromInput() {
 
       await pinInstalledTree(desktop, result.path, desktopFiles)
 
-      const expectedId = extractPluginId(
-        desktopFiles.find(file => file.name === 'plugin.js')?.text || ''
-      )
-
-      if (expectedId && baseName(result.path) !== expectedId && desktop.renamePath) {
-        const root = await desktop.desktopPluginsRoot()
-        const inventory = await localPluginInventory(desktop, root)
-        const existing = inventory.byId.get(expectedId)
-        const existingFolder = inventory.byFolder.get(expectedId)
-
-        if (
-          (!existing || existing.path === result.path) &&
-          (!existingFolder || existingFolder === result.path)
-        ) {
-          await desktop.renamePath(result.path, expectedId)
-        }
-      }
-
       outcomes.push('Desktop installed')
     }
 
     await desktop.reconcileDesktopPlugins?.().catch(() => undefined)
-    await reconcile('url-install')
+    await reconcile('url-install', { mutate: true })
 
+    const successMessage = outcomes.join(' · ') + ' · pinned ' + sha.slice(0, 8)
     installState.set({
       status: 'success',
-      message: outcomes.join(' · ') + ' · pinned ' + sha.slice(0, 8),
+      message: successMessage,
       identity: target.identity,
       sha,
       probe: { agent: hasAgent, desktop: hasDesktop },
       canApproveCore: false,
-      reviewFindings: []
+      reviewFindings: [],
+      enableAfter: requestedEnable
     })
+    host.notify?.({ kind: 'success', message: successMessage })
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
     installState.set({
       status: 'error',
-      message: error instanceof Error ? error.message : String(error),
+      message: errorMessage,
       identity: null,
       sha: null,
       probe: null,
-      canApproveCore: false
+      canApproveCore: false,
+      enableAfter: requestedEnable
     })
+    host.notify?.({ kind: 'warning', message: 'Mender install failed: ' + errorMessage })
   } finally {
     operationBusy.set(false)
   }
 }
 
-function desktopUpdateTextFile(name) {
-  return /\.(?:js|mjs|cjs|json|css|html|md|txt|svg)$/i.test(String(name || ''))
+async function discoverMenderSelfUpdate(desktop) {
+  const channel = VERSION.includes('-dev') ? 'dev' : 'main'
+  const target = parseGitHubInstallIdentifier(
+    'https://github.com/' + MENDER_REPOSITORY + '/tree/' + channel
+  )
+  const sha = await resolveGitHubInstallSha(target)
+  const files = await fetchGitHubDirectoryFiles(target.slug, '', sha)
+  if (!files) throw new Error('Could not read the Mender update source.')
+
+  const version = String(files.find(file => file.name === 'VERSION')?.text || '').trim()
+  const pluginSource = String(files.find(file => file.name === 'plugin.js')?.text || '')
+  if (!version || !pluginSource) throw new Error('Mender update source is missing VERSION or plugin.js.')
+  if (extractPluginId(pluginSource) !== ID) throw new Error('Mender update source has an unexpected plugin ID.')
+  if (compareVersions(version, VERSION) <= 0) return null
+
+  const preflightFiles = files
+    .filter(file => shouldScanRuntimePath(file.name))
+    .map(file => ({ path: file.name, text: file.text }))
+  const preflight = runPreflight(preflightFiles, { identity: MENDER_REPOSITORY, sha })
+  const decision = preflightDecision(preflight, MENDER_REPOSITORY, sha)
+  const recoverable = Boolean(
+    desktop?.desktopPluginsRoot &&
+    desktop?.writeTextFile &&
+    (desktop?.readFileText || desktop?.readPluginSource)
+  )
+  const blockedByReview = !decision.allowed
+  const status =
+    decision.stage !== 'allowed'
+      ? decision.stage
+      : recoverable
+        ? 'available'
+        : 'self-recovery-unavailable'
+
+  return {
+    kind: 'self',
+    identity: MENDER_REPOSITORY,
+    plugin: 'Hermes Mender',
+    currentVersion: VERSION,
+    targetVersion: version,
+    targetSha: sha,
+    channel,
+    status,
+    blocked: blockedByReview || !recoverable,
+    recoverable,
+    reviewFindings: preflight.findings.slice(0, 20),
+    canApproveCore: decision.canApproveCore,
+    approvalIdentity: decision.approvalIdentity,
+    approvalSha: decision.approvalSha,
+    detail:
+      decision.stage === 'security-blocked'
+        ? 'Mender security policy blocks this self-update target.'
+        : decision.stage === 'core-blocked'
+          ? 'Core protection Strict mode blocks this self-update target.'
+          : decision.stage === 'core-review-required'
+            ? 'Core protection Smart requires exact-version approval for this Mender update.'
+            : recoverable
+              ? 'Exact GitHub commit is ready for review.'
+              : 'Update found, but this Hermes Desktop build lacks the minimal local file APIs needed for in-app recovery.'
+  }
 }
 
-async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findings) {
+async function discoverAgentUpdateItems(desktop, root, catalog) {
+  const response = await host.request('plugins.manage', { action: 'list' })
+  const rows = Array.isArray(response?.plugins) ? response.plugins : []
+  const items = []
+
+  for (const row of rows) {
+    if (!row?.catalog_name || !row?.update_available) continue
+
+    const entry = catalog.find(item => item?.name === row.catalog_name)
+    const item = {
+      kind: 'plugin',
+      identity: String(row.catalog_name),
+      plugin: String(row.catalog_name),
+      agentName: String(row.name || row.catalog_name),
+      currentSha: row.installed_sha || row.pinned_sha || null,
+      targetSha: entry?.sha || null,
+      targetVersion: entry?.version || null,
+      status: 'available',
+      blocked: false,
+      reviewFindings: [],
+      capabilityChanges: [],
+      detail: entry?.sha ? 'Catalog update available.' : 'Catalog target metadata is incomplete.'
+    }
+
+    if (!entry?.repo || !/^[0-9a-f]{40}$/i.test(String(entry.sha || ''))) {
+      item.status = 'check-failed'
+      item.blocked = true
+      item.detail = 'Catalog update exists, but Mender could not resolve an exact target SHA.'
+      items.push(item)
+      continue
+    }
+
+    try {
+      const sourceFiles = await fetchPinnedRuntimeFiles(entry, entry.sha)
+      const preflight = runPreflight(sourceFiles, { identity: row.catalog_name, sha: entry.sha })
+      const decision = preflightDecision(preflight, row.catalog_name, entry.sha)
+      item.reviewFindings = preflight.findings.slice(0, 20)
+      item.canApproveCore = decision.canApproveCore
+      item.approvalIdentity = decision.approvalIdentity
+      item.approvalSha = decision.approvalSha
+
+      if (!decision.allowed) {
+        item.status = decision.stage
+        item.blocked = true
+        item.detail =
+          decision.stage === 'security-blocked'
+            ? 'Mender security policy blocks this target before Hermes update.'
+            : decision.stage === 'core-blocked'
+              ? 'Core protection Strict mode blocks this target.'
+              : 'Core protection Smart requires exact-version approval before update.'
+      }
+    } catch (error) {
+      item.status = 'check-failed'
+      item.blocked = true
+      item.detail = error instanceof Error ? error.message : String(error)
+    }
+
+    items.push(item)
+  }
+
+  return items
+}
+
+async function discoverDesktopOnlyUpdateItems(desktop, root, catalog) {
+  if (!desktop?.readDir || !desktop?.readFileText) return []
+
   const inventory = await localPluginInventory(desktop, root)
+  const items = []
 
   for (const local of inventory.byId.values()) {
     if (local.id === ID) continue
@@ -1662,27 +2050,46 @@ async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findin
     const entry = catalogEntryForLocal(local, catalog)
     if (!entry?.repo || !/^[0-9a-f]{40}$/i.test(String(entry.sha || ''))) continue
 
-    const probe = await probeUnifiedPackage(desktop, entry)
+    let probe
+    try {
+      probe = await probeUnifiedPackage(desktop, entry)
+    } catch {
+      continue
+    }
     if (!probe?.ok || probe.agent || !probe.desktop) continue
+
+    const item = {
+      kind: 'desktop',
+      identity: String(entry.name),
+      plugin: String(entry.name),
+      localId: local.id,
+      localPath: local.path,
+      targetSha: String(entry.sha).toLowerCase(),
+      targetVersion: entry.version || null,
+      repo: entry.repo,
+      subdir: entry.subdir || null,
+      status: 'available',
+      blocked: false,
+      reviewFindings: [],
+      detail: 'Desktop-only catalog update available.'
+    }
 
     let pinnedFiles
     try {
       pinnedFiles = await fetchPinnedDesktopFiles(entry, entry.sha)
     } catch (error) {
-      actions.push({
-        plugin: entry.name,
-        type: 'desktop-update-check-failed',
-        detail: error instanceof Error ? error.message : String(error)
-      })
+      item.status = 'check-failed'
+      item.blocked = true
+      item.detail = error instanceof Error ? error.message : String(error)
+      items.push(item)
       continue
     }
 
     if (pinnedFiles.some(file => !desktopUpdateTextFile(file.name))) {
-      actions.push({
-        plugin: entry.name,
-        type: 'desktop-update-review-required',
-        detail: 'Package contains non-text Desktop files; automatic update skipped.'
-      })
+      item.status = 'review-required'
+      item.blocked = true
+      item.detail = 'Package contains non-text Desktop files; Mender will not overwrite them automatically.'
+      items.push(item)
       continue
     }
 
@@ -1690,162 +2097,440 @@ async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findin
       pinnedFiles.map(file => ({ ...file, path: 'desktop/' + file.name })),
       { identity: entry.name, sha: entry.sha }
     )
-
-    findings.push(...preflight.findings.map(finding => ({ ...finding, plugin: entry.name })))
-
     const decision = preflightDecision(preflight, entry.name, entry.sha)
+    item.reviewFindings = preflight.findings.slice(0, 20)
+    item.canApproveCore = decision.canApproveCore
+    item.approvalIdentity = decision.approvalIdentity
+    item.approvalSha = decision.approvalSha
+
     if (!decision.allowed) {
-      actions.push({
-        plugin: entry.name,
-        type: decision.stage,
-        detail:
-          decision.stage === 'security-blocked'
-            ? 'Mender security policy blocked the Desktop-only update.'
-            : decision.stage === 'core-blocked'
-              ? 'Core protection Strict mode blocked this Desktop-only update.'
-              : 'Core protection Smart mode requires approval for this exact version.',
-        canApproveCore: decision.canApproveCore,
-        approvalIdentity: decision.approvalIdentity,
-        approvalSha: decision.approvalSha,
-        reviewFindings: preflight.findings
-          .filter(finding => finding.source === 'core-protection')
-          .slice(0, 8),
-        resume: 'update'
-      })
+      item.status = decision.stage
+      item.blocked = true
+      item.detail =
+        decision.stage === 'security-blocked'
+          ? 'Mender security policy blocks this Desktop-only target.'
+          : decision.stage === 'core-blocked'
+            ? 'Core protection Strict mode blocks this Desktop-only target.'
+            : 'Core protection Smart requires exact-version approval before update.'
+      items.push(item)
       continue
     }
 
     const expectedId = extractPluginId(pinnedFiles.find(file => file.name === 'plugin.js')?.text || '')
     if (expectedId && expectedId !== local.id) {
-      actions.push({
-        plugin: entry.name,
-        type: 'desktop-update-review-required',
-        detail: 'Pinned plugin ID differs from the installed plugin ID.'
-      })
+      item.status = 'review-required'
+      item.blocked = true
+      item.detail = 'Pinned plugin ID differs from the installed plugin ID.'
+      items.push(item)
       continue
     }
 
     let changed = false
-    const originals = []
-
     for (const file of pinnedFiles) {
-      const path = joinPath(local.path, file.name)
       try {
-        const current = await desktop.readFileText(path)
-        const text = String(current?.text || '')
-        originals.push({ path, existed: true, text })
-        if (text !== file.text) changed = true
+        const current = await desktop.readFileText(joinPath(local.path, file.name))
+        if (String(current?.text || '') !== file.text) {
+          changed = true
+          break
+        }
       } catch {
-        originals.push({ path, existed: false, text: '' })
         changed = true
+        break
       }
     }
 
-    if (!changed) continue
+    if (changed) items.push(item)
+  }
 
+  return items
+}
+
+async function checkForUpdates(reason = 'manual') {
+  const previous = updatePlanState.get()
+  updatePlanState.set({
+    ...previous,
+    status: 'checking',
+    error: null
+  })
+
+  const items = []
+  const errors = []
+  const desktop = window.hermesDesktop
+
+  try {
+    if (desktop?.desktopPluginsRoot && desktop?.readFileText) {
+      const root = await desktop.desktopPluginsRoot()
+      const catalog = await readCatalog(desktop, root)
+      try {
+        items.push(...(await discoverAgentUpdateItems(desktop, root, catalog)))
+      } catch (error) {
+        errors.push('Plugin update check: ' + (error instanceof Error ? error.message : String(error)))
+      }
+
+      try {
+        items.push(...(await discoverDesktopOnlyUpdateItems(desktop, root, catalog)))
+      } catch (error) {
+        errors.push('Desktop-only update check: ' + (error instanceof Error ? error.message : String(error)))
+      }
+    } else {
+      errors.push('Plugin update check: Hermes Desktop catalog APIs are unavailable.')
+    }
+  } catch (error) {
+    errors.push('Plugin update check: ' + (error instanceof Error ? error.message : String(error)))
+  }
+
+  try {
+    const selfUpdate = await discoverMenderSelfUpdate(desktop)
+    if (selfUpdate) items.push(selfUpdate)
+  } catch (error) {
+    errors.push('Mender update check: ' + (error instanceof Error ? error.message : String(error)))
+  }
+
+  const deduped = dedupeUpdateItems(items)
+  const next = {
+    status: errors.length && !deduped.length ? 'error' : 'ready',
+    checkedAt: new Date().toISOString(),
+    reason,
+    items: deduped,
+    error: errors.length ? errors.join(' · ') : null
+  }
+  updatePlanState.set(next)
+
+  if (reason === 'manual') {
+    host.notify?.({
+      kind: deduped.length ? 'success' : errors.length ? 'warning' : 'success',
+      message: deduped.length
+        ? deduped.length + ' update' + (deduped.length === 1 ? '' : 's') + ' available for review.'
+        : errors.length
+          ? 'Update check completed with errors.'
+          : 'No updates available.'
+    })
+  }
+
+  return next
+}
+
+function selectedUpdateItems(plan, review) {
+  const items = Array.isArray(plan?.items) ? plan.items : []
+  const keys = new Set(Array.isArray(review?.keys) ? review.keys : [])
+  if (!keys.size) return []
+  return items.filter(item => keys.has(item.key))
+}
+
+async function openUpdateReviewForAll() {
+  const plan = await checkForUpdates('manual')
+  if (!plan.items.length) {
+    updateReviewState.set({ open: false, keys: [] })
+    return
+  }
+  updateReviewState.set({ open: true, keys: plan.items.map(item => item.key) })
+}
+
+async function openUpdateReviewForPlugin(identity) {
+  let plan = updatePlanState.get()
+  let item = (plan.items || []).find(
+    candidate =>
+      (candidate.kind === 'plugin' || candidate.kind === 'desktop') &&
+      candidate.identity === identity
+  )
+
+  if (!item || plan.status !== 'ready') {
+    plan = await checkForUpdates('manual')
+    item = (plan.items || []).find(
+      candidate =>
+        (candidate.kind === 'plugin' || candidate.kind === 'desktop') &&
+        candidate.identity === identity
+    )
+  }
+
+  if (!item) {
+    host.notify?.({ kind: 'success', message: identity + ' is already up to date.' })
+    return
+  }
+
+  updateReviewState.set({ open: true, keys: [item.key] })
+}
+
+async function approveUpdatePlanCoreItem(item) {
+  if (!item?.canApproveCore || !item?.approvalIdentity || !item?.approvalSha) return
+  if (!setCoreVersionApproval(item.approvalIdentity, item.approvalSha, true)) return
+
+  const plan = await checkForUpdates('core-approval')
+  const refreshed = (plan.items || []).find(
+    candidate => candidate.kind === item.kind && candidate.identity === item.identity
+  )
+
+  if (refreshed) {
+    updateReviewState.set({ open: true, keys: [refreshed.key] })
+  }
+}
+
+async function writeDesktopFilesTransactional(desktop, localPath, pinnedFiles) {
+  const originals = []
+  let changed = false
+
+  for (const file of pinnedFiles || []) {
+    const path = joinPath(localPath, file.name)
     try {
-      const ordered = [
-        ...pinnedFiles.filter(file => file.name !== 'plugin.js'),
-        ...pinnedFiles.filter(file => file.name === 'plugin.js')
-      ]
+      const current = await desktop.readFileText(path)
+      const text = String(current?.text || '')
+      originals.push({ path, existed: true, text })
+      if (text !== file.text) changed = true
+    } catch {
+      originals.push({ path, existed: false, text: '' })
+      changed = true
+    }
+  }
 
-      for (const file of ordered) {
-        await desktop.writeTextFile(joinPath(local.path, file.name), file.text)
-      }
+  if (!changed) {
+    return { ok: true, changed: false, rolledBack: false, error: null }
+  }
 
-      actions.push({
-        plugin: entry.name,
-        type: 'desktop-update-applied',
-        detail: 'Updated Desktop-only package to pin ' + String(entry.sha).slice(0, 8) + '.'
-      })
-    } catch (error) {
-      for (const original of originals.reverse()) {
-        try {
-          if (original.existed) {
-            await desktop.writeTextFile(original.path, original.text)
-          } else if (desktop.trashPath) {
-            await desktop.trashPath(original.path)
-          }
-        } catch {}
-      }
+  const ordered = [
+    ...(pinnedFiles || []).filter(file => file.name !== 'plugin.js'),
+    ...(pinnedFiles || []).filter(file => file.name === 'plugin.js')
+  ]
 
-      actions.push({
-        plugin: entry.name,
-        type: 'desktop-update-failed',
-        detail: error instanceof Error ? error.message : String(error)
-      })
+  try {
+    for (const file of ordered) {
+      await desktop.writeTextFile(joinPath(localPath, file.name), file.text)
+    }
+    return { ok: true, changed: true, rolledBack: false, error: null }
+  } catch (error) {
+    for (const original of [...originals].reverse()) {
+      try {
+        if (original.existed) {
+          await desktop.writeTextFile(original.path, original.text)
+        } else if (desktop.trashPath) {
+          await desktop.trashPath(original.path)
+        }
+      } catch {}
+    }
+
+    return {
+      ok: false,
+      changed: true,
+      rolledBack: true,
+      error: error instanceof Error ? error.message : String(error)
     }
   }
 }
 
-async function updateAllPlugins() {
-  if (operationBusy.get()) return
-  operationBusy.set(true)
+async function applyDesktopOnlyUpdateItem(item) {
+  const desktop = window.hermesDesktop
+  if (!desktop?.readFileText || !desktop?.writeTextFile || !item?.localPath || !item?.targetSha) {
+    return {
+      plugin: item?.plugin || 'Desktop plugin',
+      type: 'desktop-update-failed',
+      detail: 'Required Desktop file APIs are unavailable.'
+    }
+  }
 
+  const entry = {
+    name: item.identity,
+    repo: item.repo,
+    subdir: item.subdir || null,
+    sha: item.targetSha
+  }
+
+  let pinnedFiles
+  try {
+    pinnedFiles = await fetchPinnedDesktopFiles(entry, item.targetSha)
+  } catch (error) {
+    return {
+      plugin: item.plugin,
+      type: 'desktop-update-failed',
+      detail: error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  if (pinnedFiles.some(file => !desktopUpdateTextFile(file.name))) {
+    return {
+      plugin: item.plugin,
+      type: 'desktop-update-review-required',
+      detail: 'Package contains non-text Desktop files; update was not applied.'
+    }
+  }
+
+  const expectedId = extractPluginId(pinnedFiles.find(file => file.name === 'plugin.js')?.text || '')
+  if (expectedId && expectedId !== item.localId) {
+    return {
+      plugin: item.plugin,
+      type: 'desktop-update-review-required',
+      detail: 'Pinned plugin ID differs from the installed plugin ID.'
+    }
+  }
+
+  const transaction = await writeDesktopFilesTransactional(desktop, item.localPath, pinnedFiles)
+
+  if (!transaction.changed) {
+    return {
+      plugin: item.plugin,
+      type: 'update-unchanged',
+      detail: 'Desktop-only package already matches pin ' + item.targetSha.slice(0, 8) + '.'
+    }
+  }
+
+  if (!transaction.ok) {
+    return {
+      plugin: item.plugin,
+      type: 'desktop-update-failed',
+      detail:
+        (transaction.error || 'Desktop update write failed.') +
+        (transaction.rolledBack ? ' · previous files restored' : '')
+    }
+  }
+
+  return {
+    plugin: item.plugin,
+    type: 'desktop-update-applied',
+    detail: 'Updated Desktop-only package to pin ' + item.targetSha.slice(0, 8) + '.'
+  }
+}
+
+async function applyMenderSelfUpdate(item) {
+  const desktop = window.hermesDesktop
+  if (!item?.recoverable || !desktop?.desktopPluginsRoot || !desktop?.writeTextFile) {
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-unavailable',
+      detail: item?.detail || 'This Hermes Desktop build cannot safely replace Mender in-app.'
+    }
+  }
+
+  const target = parseGitHubInstallIdentifier(
+    'https://github.com/' + MENDER_REPOSITORY + '/tree/' + String(item.channel || 'main')
+  )
+  const sha = await resolveGitHubInstallSha(target)
+  if (sha !== item.targetSha) {
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-stale-review',
+      detail: 'GitHub changed since review. Check updates again before installing.'
+    }
+  }
+
+  const files = await fetchGitHubDirectoryFiles(target.slug, '', sha)
+  const pluginSource = String(files?.find(file => file.name === 'plugin.js')?.text || '')
+  const version = String(files?.find(file => file.name === 'VERSION')?.text || '').trim()
+  if (!pluginSource || version !== item.targetVersion || extractPluginId(pluginSource) !== ID) {
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-failed',
+      detail: 'Reviewed Mender source no longer matches the selected version.'
+    }
+  }
+
+  const preflight = runPreflight(
+    (files || [])
+      .filter(file => shouldScanRuntimePath(file.name))
+      .map(file => ({ path: file.name, text: file.text })),
+    { identity: MENDER_REPOSITORY, sha }
+  )
+  const decision = preflightDecision(preflight, MENDER_REPOSITORY, sha)
+  if (!decision.allowed) {
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-not-applied',
+      detail:
+        decision.stage === 'security-blocked'
+          ? 'Mender security policy now blocks the reviewed self-update.'
+          : decision.stage === 'core-blocked'
+            ? 'Core protection Strict now blocks the reviewed self-update.'
+            : 'Core protection requires exact-version approval before this self-update can be applied.',
+      reviewFindings: preflight.findings.slice(0, 12)
+    }
+  }
+
+  const root = await desktop.desktopPluginsRoot()
+  const path = joinPath(root, ID, 'plugin.js')
+  const before = await readPluginText(desktop, path)
+
+  try {
+    await desktop.writeTextFile(path, pluginSource)
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-applied',
+      detail: 'Updated to ' + version + ' · pinned ' + sha.slice(0, 8) + '.'
+    }
+  } catch (error) {
+    try {
+      await desktop.writeTextFile(path, before)
+    } catch {}
+    return {
+      plugin: 'Hermes Mender',
+      type: 'self-update-failed',
+      detail: error instanceof Error ? error.message : String(error)
+    }
+  }
+}
+
+async function applyConfirmedUpdates(options = {}) {
+  if (operationBusy.get()) return []
+  const refreshPlan = options?.refresh !== false
+  const reconcileAfter = options?.reconcile !== false
+  const plan = updatePlanState.get()
+  const review = updateReviewState.get()
+  const selected = selectedUpdateItems(plan, review)
   const actions = []
   const findings = []
 
+  if (!selected.length) {
+    updateReviewState.set({ open: false, keys: [] })
+    return []
+  }
+
+  operationBusy.set(true)
+
   try {
-    const desktop = window.hermesDesktop
-    if (!desktop?.desktopPluginsRoot) throw new Error('Hermes Desktop plugin bridge unavailable')
+    for (const item of selected) {
+      if (!isUpdateItemApplicable(item)) {
+        actions.push({
+          plugin: item.plugin,
+          type: 'update-not-applied',
+          detail: item.detail || 'This update is blocked or requires additional review.'
+        })
+        continue
+      }
 
-    const root = await desktop.desktopPluginsRoot()
-    const catalog = await readCatalog(desktop, root)
-    const response = await host.request('plugins.manage', { action: 'list' })
-    const rows = Array.isArray(response?.plugins) ? response.plugins : []
+      if (item.kind === 'self') {
+        const result = await applyMenderSelfUpdate(item)
+        actions.push(result)
+        continue
+      }
 
-    for (const row of rows) {
-      if (!row?.catalog_name || !row?.update_available) continue
-
-      try {
-        const entry = catalog.find(item => item?.name === row.catalog_name)
-        if (entry?.repo && /^[0-9a-f]{40}$/i.test(String(entry.sha || ''))) {
-          let sourceFiles
-          try {
-            sourceFiles = await fetchPinnedRuntimeFiles(entry, entry.sha)
-          } catch (error) {
-            actions.push({
-              plugin: row.catalog_name,
-              type: 'update-preflight-failed',
-              detail: error instanceof Error ? error.message : String(error)
-            })
-            continue
-          }
-
-          const preflight = runPreflight(sourceFiles, { identity: row.catalog_name, sha: entry.sha })
-          findings.push(...preflight.findings.map(finding => ({ ...finding, plugin: row.catalog_name })))
-
-          const decision = preflightDecision(preflight, row.catalog_name, entry.sha)
-          if (!decision.allowed) {
-            actions.push({
-              plugin: row.catalog_name,
-              type: decision.stage,
-              detail:
-                decision.stage === 'security-blocked'
-                  ? 'Mender security policy blocked the update before Hermes re-pin.'
-                  : decision.stage === 'core-blocked'
-                    ? 'Core protection Strict mode blocked this update.'
-                    : 'Core protection Smart mode requires approval for this exact version.',
-              canApproveCore: decision.canApproveCore,
-              approvalIdentity: decision.approvalIdentity,
-              approvalSha: decision.approvalSha,
-              reviewFindings: preflight.findings
-                .filter(finding => finding.source === 'core-protection')
-                .slice(0, 8),
-              resume: 'update'
-            })
-            continue
-          }
+      if (item.kind === 'desktop') {
+        if (!compatibilityAllowsMutations()) {
+          actions.push({
+            plugin: item.plugin,
+            type: 'update-not-applied',
+            detail: 'Current Hermes compatibility is Unsupported.'
+          })
+          continue
         }
 
+        actions.push(await applyDesktopOnlyUpdateItem(item))
+        continue
+      }
+
+      if (!compatibilityAllowsMutations()) {
+        actions.push({
+          plugin: item.plugin,
+          type: 'update-not-applied',
+          detail: 'Current Hermes compatibility is Unsupported.'
+        })
+        continue
+      }
+
+      try {
         const result = await host.request('plugins.manage', {
           action: 'update',
-          name: row.name
+          name: item.agentName
         })
 
         if (result?.consent_required) {
           actions.push({
-            plugin: row.catalog_name,
+            plugin: item.plugin,
             type: 'update-review-required',
             detail: (result.delta_lines || []).slice(0, 4).join(' · ') || 'Update widens plugin capabilities.',
             capabilityChanges: (result.delta_lines || []).slice(0, 12)
@@ -1854,39 +2539,36 @@ async function updateAllPlugins() {
         }
 
         if (!result?.ok) {
-          if (result?.scan_blocked) {
-            actions.push({
-              plugin: row.catalog_name,
-              type: 'hermes-core-update-blocked',
-              detail: result?.error || 'Hermes Core security scan blocked the update.'
-            })
-          } else {
-            actions.push({
-              plugin: row.catalog_name,
-              type: 'update-failed',
-              detail: result?.error || 'Hermes rejected the update.'
-            })
-          }
+          actions.push({
+            plugin: item.plugin,
+            type: isHermesScannerBlockedResult(result) ? 'hermes-core-update-blocked' : 'update-failed',
+            detail:
+              result?.error ||
+              (isHermesScannerBlockedResult(result)
+                ? 'Hermes Core security scan blocked the update.'
+                : 'Hermes rejected the update.')
+          })
           continue
         }
 
         actions.push({
-          plugin: row.catalog_name,
+          plugin: item.plugin,
           type: result?.unchanged ? 'update-unchanged' : 'update-applied',
           detail: result?.unchanged ? 'Already at current catalog pin.' : 'Updated through plugins.manage.'
         })
       } catch (error) {
         actions.push({
-          plugin: row.catalog_name,
+          plugin: item.plugin,
           type: 'update-failed',
           detail: error instanceof Error ? error.message : String(error)
         })
       }
     }
 
-    await updateDesktopOnlyPackages(desktop, root, catalog, actions, findings)
-    await desktop.reconcileDesktopPlugins?.().catch(() => undefined)
-    await reconcile('update-all')
+    if (reconcileAfter) {
+      await window.hermesDesktop?.reconcileDesktopPlugins?.().catch(() => undefined)
+      await reconcile('update-confirmed', { mutate: false })
+    }
 
     const current = menderState.get()
     menderState.set({
@@ -1894,14 +2576,33 @@ async function updateAllPlugins() {
       findings: [...findings, ...(current.findings || [])].slice(0, 160),
       actions: [...actions, ...(current.actions || [])].slice(0, 60)
     })
-  } catch (error) {
-    menderState.set({
-      ...menderState.get(),
-      error: error instanceof Error ? error.message : String(error)
+
+    const applied = actions.filter(action => ['update-applied', 'update-unchanged', 'self-update-applied'].includes(action.type)).length
+    const held = actions.length - applied
+    host.notify?.({
+      kind: held ? 'warning' : 'success',
+      message:
+        applied +
+        ' update' +
+        (applied === 1 ? '' : 's') +
+        ' applied' +
+        (held ? ' · ' + held + ' held for review or blocked' : '')
     })
   } finally {
+    updateReviewState.set({ open: false, keys: [] })
     operationBusy.set(false)
+    if (refreshPlan) void checkForUpdates('post-update')
   }
+
+  return actions
+}
+
+async function updateAllPlugins() {
+  await openUpdateReviewForAll()
+}
+
+function desktopUpdateTextFile(name) {
+  return /\.(?:js|mjs|cjs|json|css|html|md|txt|svg)$/i.test(String(name || ''))
 }
 
 async function startDirectoryWatch() {
@@ -1915,9 +2616,9 @@ async function startDirectoryWatch() {
   if (!directoryWatchId) return
 
   stopDirectoryEvents = desktop.onPreviewFileChanged(payload => {
-    if (payload?.id === directoryWatchId) {
-      void reconcile('directory-change')
-    }
+    if (payload?.id !== directoryWatchId) return
+    if (repairScheduleMode.get() !== 'auto' || operationBusy.get()) return
+    void reconcile('directory-change', { mutate: true })
   })
 }
 
@@ -1972,12 +2673,25 @@ function MenderPage() {
   const approvals = useValue(coreVersionApprovals)
   const respectUninstall = useValue(respectUninstallIntent)
   const autoEnable = useValue(autoEnableRepairedAgents)
+  const repairSchedule = useValue(repairScheduleMode)
+  const repairInterval = useValue(repairIntervalSeconds)
+  const updatePolicy = useValue(updateCheckMode)
+  const updateInterval = useValue(updateCheckIntervalSeconds)
+  const updatePlan = useValue(updatePlanState)
+  const updateReview = useValue(updateReviewState)
   const busy = useValue(operationBusy)
+  const pendingUninstall = useValue(uninstallConfirmItem)
   const installValue = useValue(installIdentifier)
-  const enableAfterInstall = useValue(installEnableAfter)
+  const enableAfterInstallDefault = useValue(installEnableAfterDefault)
   const install = useValue(installState)
   const compatibility = useValue(compatibilityState)
   const actionsAllowed = compatibility.status !== 'unsupported' && compatibility.status !== 'checking'
+  const reviewItems = selectedUpdateItems(updatePlan, updateReview)
+  const applicableReviewItems = reviewItems.filter(item =>
+    isUpdateItemApplicable(item) && (item.kind === 'self' || actionsAllowed)
+  )
+  const selfUpdateItem = (updatePlan.items || []).find(item => item.kind === 'self') || null
+  const updateReviewAllowed = actionsAllowed || Boolean(selfUpdateItem)
   const securityFindings = (state.findings || []).filter(finding => finding.source !== 'core-protection')
   const coreFindings = (state.findings || []).filter(finding => finding.source === 'core-protection')
   const securityCounts = riskCounts(securityFindings)
@@ -2018,20 +2732,246 @@ function MenderPage() {
               jsx(Button, {
                 size: 'sm',
                 variant: 'outline',
-                disabled: state.running || busy || !actionsAllowed,
+                disabled:
+                  state.running ||
+                  busy ||
+                  updatePlan.status === 'checking' ||
+                  (!updateReviewAllowed && compatibility.status !== 'checking'),
                 onClick: () => void updateAllPlugins(),
-                children: busy ? 'Working…' : 'Update all'
+                children: updatePlan.status === 'checking' ? 'Checking updates…' : 'Update all'
               }),
               jsx(Button, {
                 size: 'sm',
                 variant: 'outline',
-                disabled: state.running || busy,
+                disabled: state.running || busy || !actionsAllowed,
                 onClick: () => void reconcile('manual'),
                 children: state.running ? 'Checking…' : 'Repair now'
               })
             ]
           })
         ]
+      }),
+
+      (updatePlan.items || []).length
+        ? jsxs('div', {
+            className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-4 py-3',
+            children: [
+              jsxs('div', {
+                className: 'min-w-0',
+                children: [
+                  jsx('div', {
+                    className: 'font-medium',
+                    children:
+                      (updatePlan.items || []).length +
+                      ' update' +
+                      ((updatePlan.items || []).length === 1 ? '' : 's') +
+                      ' available' +
+                      ((updatePlan.items || []).filter(item => item.blocked).length
+                        ? ' · ' +
+                          (updatePlan.items || []).filter(item => item.blocked).length +
+                          ' need review'
+                        : '')
+                  }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children: selfUpdateItem
+                      ? 'Includes Hermes Mender ' + VERSION + ' → ' + selfUpdateItem.targetVersion + '. Nothing installs until you confirm the review.'
+                      : 'Updates were discovered only. Nothing installs until you confirm the review.'
+                  })
+                ]
+              }),
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: busy || updatePlan.status === 'checking',
+                onClick: () =>
+                  updateReviewState.set({
+                    open: true,
+                    keys: (updatePlan.items || []).map(item => item.key)
+                  }),
+                children: 'Review updates'
+              })
+            ]
+          })
+        : null,
+
+      updatePlan.error
+        ? jsx('div', {
+            className: 'rounded-md border border-orange-500/30 px-3 py-2 text-xs text-orange-300',
+            children: updatePlan.error
+          })
+        : null,
+
+      jsx(Dialog, {
+        open: Boolean(pendingUninstall),
+        onOpenChange: open => {
+          if (!open && !busy) uninstallConfirmItem.set(null)
+        },
+        children: jsx(DialogContent, {
+          children: jsxs('div', {
+            children: [
+              jsxs(DialogHeader, {
+                children: [
+                  jsx(DialogTitle, { children: pendingUninstall ? 'Uninstall ' + pendingUninstall.catalog + '?' : 'Uninstall plugin?' }),
+                  jsx(DialogDescription, {
+                    children: pendingUninstall
+                      ? 'Mender will remove every installed half it manages for this package. This uses Hermes\' normal plugin removal path and keeps uninstall intent protection active.'
+                      : ''
+                  })
+                ]
+              }),
+              jsxs(DialogFooter, {
+                children: [
+                  jsx(Button, {
+                    variant: 'outline',
+                    disabled: busy,
+                    onClick: () => uninstallConfirmItem.set(null),
+                    children: 'Cancel'
+                  }),
+                  jsx(Button, {
+                    variant: 'destructive',
+                    loading: busy,
+                    onClick: () => {
+                      const item = uninstallConfirmItem.get()
+                      uninstallConfirmItem.set(null)
+                      if (item) void uninstallPlugin(item)
+                    },
+                    children: 'Uninstall'
+                  })
+                ]
+              })
+            ]
+          })
+        })
+      }),
+
+      jsx(Dialog, {
+        open: Boolean(updateReview.open),
+        onOpenChange: open => {
+          if (!open && !busy) updateReviewState.set({ open: false, keys: [] })
+        },
+        children: jsx(DialogContent, {
+          children: jsxs('div', {
+            className: 'flex flex-col gap-4',
+            children: [
+              jsxs(DialogHeader, {
+                children: [
+                  jsx(DialogTitle, { children: 'Review updates' }),
+                  jsx(DialogDescription, {
+                    children:
+                      'Nothing is installed until you confirm here. Blocked or additional-review items are never applied automatically.'
+                  })
+                ]
+              }),
+              reviewItems.length
+                ? jsx('div', {
+                    className: 'flex flex-col gap-2',
+                    style: { maxHeight: '420px', overflowY: 'auto', paddingRight: '4px' },
+                    children: reviewItems.map(item =>
+                      jsxs('div', {
+                        className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                        children: [
+                          jsxs('div', {
+                            className: 'flex items-center justify-between gap-3',
+                            children: [
+                              jsxs('div', {
+                                className: 'min-w-0',
+                                children: [
+                                  jsx('div', {
+                                    className: 'font-medium',
+                                    children: item.plugin
+                                  }),
+                                  jsx('div', {
+                                    className: 'text-xs text-(--ui-text-tertiary)',
+                                    children:
+                                      item.kind === 'self'
+                                        ? item.currentVersion + ' → ' + item.targetVersion + ' · ' + String(item.targetSha || '').slice(0, 8)
+                                        : (item.currentSha ? String(item.currentSha).slice(0, 8) : 'current') +
+                                          ' → ' +
+                                          (item.targetSha ? String(item.targetSha).slice(0, 8) : item.targetVersion || 'target')
+                                  })
+                                ]
+                              }),
+                              jsx('div', {
+                                className:
+                                  item.status === 'available'
+                                    ? 'text-xs text-green-400'
+                                    : item.status === 'core-review-required'
+                                      ? 'text-xs text-orange-400'
+                                      : 'text-xs text-red-400',
+                                children:
+                                  item.status === 'available'
+                                    ? 'Ready'
+                                    : item.status === 'core-review-required'
+                                      ? 'Exact-version approval required'
+                                      : 'Blocked / unavailable'
+                              })
+                            ]
+                          }),
+                          item.detail
+                            ? jsx('div', {
+                                className: 'mt-1 text-xs text-(--ui-text-secondary)',
+                                children: item.detail
+                              })
+                            : null,
+                          (item.reviewFindings || []).length
+                            ? jsx('div', {
+                                className: 'mt-2 flex flex-col gap-1',
+                                children: (item.reviewFindings || []).slice(0, 6).map((finding, findingIndex) =>
+                                  jsxs('div', {
+                                    className: 'rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs',
+                                    children: [
+                                      jsx('span', {
+                                        className: severityClass(finding.severity) + ' font-medium',
+                                        children: finding.id
+                                      }),
+                                      jsx('span', { children: ' · ' + finding.label })
+                                    ]
+                                  }, item.key + '-review-' + findingIndex)
+                                )
+                              })
+                            : null,
+                          item.canApproveCore && item.approvalIdentity && item.approvalSha
+                            ? jsx(Button, {
+                                size: 'xs',
+                                variant: 'outline',
+                                className: 'mt-2',
+                                disabled: busy,
+                                onClick: () => void approveUpdatePlanCoreItem(item),
+                                children: 'Allow this exact version'
+                              })
+                            : null
+                        ]
+                      }, item.key)
+                    )
+                  })
+                : jsx('div', {
+                    className: 'text-(--ui-text-tertiary)',
+                    children: 'No reviewed updates are currently selected.'
+                  }),
+              jsxs(DialogFooter, {
+                children: [
+                  jsx(Button, {
+                    variant: 'outline',
+                    disabled: busy,
+                    onClick: () => updateReviewState.set({ open: false, keys: [] }),
+                    children: 'Cancel'
+                  }),
+                  jsx(Button, {
+                    disabled: busy || !applicableReviewItems.length,
+                    loading: busy,
+                    onClick: () => void applyConfirmedUpdates(),
+                    children:
+                      'Apply ' +
+                      applicableReviewItems.length +
+                      ' update' +
+                      (applicableReviewItems.length === 1 ? '' : 's')
+                  })
+                ]
+              })
+            ]
+          })
+        })
       }),
 
       state.error
@@ -2215,6 +3155,66 @@ function MenderPage() {
         className: 'flex flex-col gap-2',
         children: [
           jsx('div', { className: 'font-medium', children: 'Repair behavior' }),
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+            children: [
+              jsxs('div', {
+                className: 'min-w-0',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Automatic repair' }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      repairSchedule === 'off'
+                        ? 'Off: only Repair now performs repair mutations.'
+                        : repairSchedule === 'interval'
+                          ? 'Interval: repair runs only on the selected periodic cadence.'
+                          : 'Auto: native Desktop changes repair promptly; a 5-minute fallback catches remote changes.'
+                  })
+                ]
+              }),
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: ['auto', 'interval', 'off'].map(option =>
+                  jsx(Button, {
+                    size: 'sm',
+                    variant: 'outline',
+                    disabled: busy,
+                    onClick: () => setRepairScheduleMode(option),
+                    children: (repairSchedule === option ? '✓ ' : '') + (option === 'auto' ? 'Auto' : option === 'interval' ? 'Interval' : 'Off')
+                  }, option)
+                )
+              })
+            ]
+          }),
+          repairSchedule === 'interval'
+            ? jsxs('div', {
+                className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                children: [
+                  jsxs('div', {
+                    children: [
+                      jsx('div', { className: 'font-medium', children: 'Repair interval' }),
+                      jsx('div', {
+                        className: 'text-xs text-(--ui-text-tertiary)',
+                        children: 'Choose how often Mender checks and repairs while Interval mode is active.'
+                      })
+                    ]
+                  }),
+                  jsx('select', {
+                    value: String(repairInterval),
+                    disabled: busy,
+                    className: 'rounded-md border border-(--ui-stroke-secondary) bg-transparent px-3 py-1.5',
+                    onChange: event => setRepairIntervalSeconds(event?.target?.value),
+                    children: REPAIR_INTERVAL_OPTIONS.map(seconds =>
+                      jsx('option', {
+                        value: String(seconds),
+                        children: seconds < 60 ? seconds + ' s' : seconds < 3600 ? seconds / 60 + ' min' : seconds / 3600 + ' h'
+                      }, String(seconds))
+                    )
+                  })
+                ]
+              })
+            : null,
           jsx(PreferenceRow, {
             title: 'Respect uninstall actions',
             description:
@@ -2231,6 +3231,98 @@ function MenderPage() {
             disabled: busy,
             onChange: value => setBooleanPreference('repair.autoEnableAgents', autoEnableRepairedAgents, value)
           })
+        ]
+      }),
+
+      jsxs('section', {
+        className: 'flex flex-col gap-2',
+        children: [
+          jsx('div', { className: 'font-medium', children: 'Update checking' }),
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+            children: [
+              jsxs('div', {
+                className: 'min-w-0',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Automatic update checks' }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children:
+                      updatePolicy === 'off'
+                        ? 'Off: Mender only checks when you press Check updates.'
+                        : updatePolicy === 'interval'
+                          ? 'Interval: discover updates on the selected cadence. Discovery never installs them.'
+                          : 'Auto: check on startup/connection and every 6 hours. Discovery never installs updates.'
+                  })
+                ]
+              }),
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: [
+                  ...['auto', 'interval', 'off'].map(option =>
+                    jsx(Button, {
+                      size: 'sm',
+                      variant: 'outline',
+                      disabled: busy || updatePlan.status === 'checking',
+                      onClick: () => setUpdateCheckMode(option),
+                      children:
+                        (updatePolicy === option ? '✓ ' : '') +
+                        (option === 'auto' ? 'Auto' : option === 'interval' ? 'Interval' : 'Off')
+                    }, 'update-policy-' + option)
+                  ),
+                  jsx(Button, {
+                    size: 'sm',
+                    variant: 'outline',
+                    disabled: busy || updatePlan.status === 'checking',
+                    onClick: () => void checkForUpdates('manual'),
+                    children: updatePlan.status === 'checking' ? 'Checking…' : 'Check updates'
+                  })
+                ]
+              })
+            ]
+          }),
+          updatePolicy === 'interval'
+            ? jsxs('div', {
+                className: 'flex items-center justify-between gap-4 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
+                children: [
+                  jsxs('div', {
+                    children: [
+                      jsx('div', { className: 'font-medium', children: 'Update-check interval' }),
+                      jsx('div', {
+                        className: 'text-xs text-(--ui-text-tertiary)',
+                        children: 'Controls discovery only. Applying updates always needs explicit confirmation.'
+                      })
+                    ]
+                  }),
+                  jsx('select', {
+                    value: String(updateInterval),
+                    disabled: busy || updatePlan.status === 'checking',
+                    className: 'rounded-md border border-(--ui-stroke-secondary) bg-transparent px-3 py-1.5',
+                    onChange: event => setUpdateCheckIntervalSeconds(event?.target?.value),
+                    children: UPDATE_CHECK_INTERVAL_OPTIONS.map(seconds =>
+                      jsx('option', {
+                        value: String(seconds),
+                        children:
+                          seconds < 3600
+                            ? seconds / 60 + ' min'
+                            : seconds < 86400
+                              ? seconds / 3600 + ' h'
+                              : seconds / 86400 + ' day'
+                      }, 'update-interval-' + String(seconds))
+                    )
+                  })
+                ]
+              })
+            : null,
+          updatePlan.checkedAt
+            ? jsx('div', {
+                className: 'text-xs text-(--ui-text-quaternary)',
+                children:
+                  'Last update check: ' +
+                  updatePlan.checkedAt +
+                  (updatePlan.reason ? ' · ' + updatePlan.reason : '')
+              })
+            : null
         ]
       }),
 
@@ -2261,26 +3353,40 @@ function MenderPage() {
                     identity: null,
                     sha: null,
                     probe: null,
-                    canApproveCore: false
+                    canApproveCore: false,
+                    reviewFindings: [],
+                    enableAfter: false
                   })
+                },
+                onKeyDown: event => {
+                  if (event?.key !== 'Enter' || busy || !actionsAllowed) return
+                  event.preventDefault?.()
+                  void installFromInput(enableAfterInstallDefault)
                 }
               }),
               jsx(Button, {
                 size: 'sm',
                 variant: 'outline',
                 disabled: busy || !actionsAllowed || !String(installValue || '').trim(),
-                onClick: () => void installFromInput(),
-                children: busy ? 'Checking…' : 'Install'
+                onClick: () => void installFromInput(false),
+                children: busy && install.status === 'checking' && !install.enableAfter ? 'Checking…' : 'Install'
+              }),
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: busy || !actionsAllowed || !String(installValue || '').trim(),
+                onClick: () => void installFromInput(true),
+                children: busy && install.status === 'checking' && install.enableAfter ? 'Checking…' : 'Install & enable'
               })
             ]
           }),
           jsx(PreferenceRow, {
             title: 'Enable after install',
             description:
-              'Off by default. The Agent half is installed disabled; turn this on only when you want Hermes to activate it immediately after all checks pass.',
-            value: enableAfterInstall,
+              'Persistent default for GitHub installs when you press Enter in the repository field. The Install and Install & enable buttons remain explicit one-shot choices.',
+            value: enableAfterInstallDefault,
             disabled: busy,
-            onChange: value => installEnableAfter.set(Boolean(value))
+            onChange: value => setBooleanPreference('install.enableAfterDefault', installEnableAfterDefault, value)
           }),
           install.message
             ? jsxs('div', {
@@ -2357,15 +3463,23 @@ function MenderPage() {
       }),
 
       jsxs('div', {
-        className: 'grid grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]',
+        className: 'grid items-start gap-4',
+        style: { gridTemplateColumns: 'minmax(0, 3fr) minmax(360px, 2fr)' },
         children: [
           jsxs('section', {
-            className: 'flex min-w-0 flex-col gap-2',
+            className: 'flex min-w-0 flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
             children: [
-              jsx('div', { className: 'font-medium', children: 'Plugin halves' }),
+              jsxs('div', {
+                className: 'flex items-center justify-between gap-3',
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'Plugin halves' }),
+                  jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: state.halves.length + ' packages' })
+                ]
+              }),
               state.halves.length
                 ? jsx('div', {
                     className: 'flex flex-col gap-1',
+                    style: { maxHeight: '560px', overflowY: 'auto', paddingRight: '4px' },
                     children: state.halves.map(item =>
                       jsxs('div', {
                         className: 'grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
@@ -2403,22 +3517,33 @@ function MenderPage() {
                           jsxs('div', {
                             className: 'flex items-center gap-1',
                             children: [
-                              item.agent &&
-                              item.agentStatus !== 'enabled' &&
-                              item.agentKey
+                              (updatePlan.items || []).some(
+                                candidate =>
+                                  (candidate.kind === 'plugin' || candidate.kind === 'desktop') &&
+                                  candidate.identity === item.catalog
+                              )
+                                ? jsx(Button, {
+                                    size: 'xs',
+                                    variant: 'outline',
+                                    disabled: busy || state.running || updatePlan.status === 'checking',
+                                    onClick: () => void openUpdateReviewForPlugin(item.catalog),
+                                    children: 'Update'
+                                  })
+                                : null,
+                              item.agent && item.agentKey
                                 ? jsx(Button, {
                                     size: 'xs',
                                     variant: 'outline',
                                     disabled: busy || state.running || !actionsAllowed,
-                                    onClick: () => void setAgentEnabled(item, true),
-                                    children: 'Enable'
+                                    onClick: () => void setAgentEnabled(item, item.agentStatus !== 'enabled'),
+                                    children: item.agentStatus === 'enabled' ? 'Disable' : 'Enable'
                                   })
                                 : null,
                               jsx(Button, {
                                 size: 'xs',
                                 variant: 'outline',
                                 disabled: busy || state.running || !actionsAllowed,
-                                onClick: () => void uninstallPlugin(item),
+                                onClick: () => uninstallConfirmItem.set(item),
                                 children: 'Uninstall'
                               })
                             ]
@@ -2435,9 +3560,15 @@ function MenderPage() {
             className: 'flex min-w-0 flex-col gap-4',
             children: [
               jsxs('section', {
-                className: 'flex flex-col gap-2',
+                className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
                 children: [
-                  jsx('div', { className: 'font-medium', children: 'Security preflight' }),
+                  jsxs('div', {
+                    className: 'flex items-center justify-between gap-3',
+                    children: [
+                      jsx('div', { className: 'font-medium', children: 'Security preflight' }),
+                      jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: securityFindings.length + ' signals' })
+                    ]
+                  }),
                   jsx('div', {
                     className: 'text-xs text-(--ui-text-tertiary)',
                     children:
@@ -2446,7 +3577,8 @@ function MenderPage() {
                   securityFindings.length
                     ? jsx('div', {
                         className: 'flex flex-col gap-1',
-                        children: securityFindings.slice(0, 40).map((finding, index) =>
+                        style: { maxHeight: '240px', overflowY: 'auto', paddingRight: '4px' },
+                        children: securityFindings.slice(0, 80).map((finding, index) =>
                           jsxs('div', {
                             className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
                             children: [
@@ -2462,9 +3594,15 @@ function MenderPage() {
               }),
 
               jsxs('section', {
-                className: 'flex flex-col gap-2',
+                className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
                 children: [
-                  jsx('div', { className: 'font-medium', children: 'Core protection findings' }),
+                  jsxs('div', {
+                    className: 'flex items-center justify-between gap-3',
+                    children: [
+                      jsx('div', { className: 'font-medium', children: 'Core protection findings' }),
+                      jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: coreFindings.length + ' signals' })
+                    ]
+                  }),
                   jsx('div', {
                     className: 'text-xs text-(--ui-text-tertiary)',
                     children:
@@ -2477,7 +3615,8 @@ function MenderPage() {
                   coreFindings.length
                     ? jsx('div', {
                         className: 'flex flex-col gap-1',
-                        children: coreFindings.slice(0, 40).map((finding, index) =>
+                        style: { maxHeight: '180px', overflowY: 'auto', paddingRight: '4px' },
+                        children: coreFindings.slice(0, 60).map((finding, index) =>
                           jsxs('div', {
                             className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
                             children: [
@@ -2502,13 +3641,20 @@ function MenderPage() {
               }),
 
               jsxs('section', {
-                className: 'flex flex-col gap-2',
+                className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
                 children: [
-                  jsx('div', { className: 'font-medium', children: 'Last repair actions' }),
+                  jsxs('div', {
+                    className: 'flex items-center justify-between gap-3',
+                    children: [
+                      jsx('div', { className: 'font-medium', children: 'Recent actions' }),
+                      jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: state.actions.length + ' recorded' })
+                    ]
+                  }),
                   state.actions.length
                     ? jsx('div', {
                         className: 'flex flex-col gap-1',
-                        children: [...state.actions].reverse().slice(0, 20).map((action, index) =>
+                        style: { maxHeight: '240px', overflowY: 'auto', paddingRight: '4px' },
+                        children: [...state.actions].reverse().slice(0, 40).map((action, index) =>
                           jsxs('div', {
                             className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2',
                             children: [
@@ -2618,24 +3764,48 @@ const plugin = {
     coreVersionApprovals.set(savedApprovals && typeof savedApprovals === 'object' ? savedApprovals : {})
     respectUninstallIntent.set(Boolean(ctx.storage.get('repair.respectUninstallIntent', true)))
     autoEnableRepairedAgents.set(Boolean(ctx.storage.get('repair.autoEnableAgents', false)))
+    installEnableAfterDefault.set(Boolean(ctx.storage.get('install.enableAfterDefault', false)))
+    const savedRepairSchedule = ctx.storage.get('repair.scheduleMode', 'auto')
+    repairScheduleMode.set(REPAIR_SCHEDULE_MODES.has(savedRepairSchedule) ? savedRepairSchedule : 'auto')
+    repairIntervalSeconds.set(
+      normalizeRepairIntervalSeconds(ctx.storage.get('repair.intervalSeconds', DEFAULT_REPAIR_INTERVAL_SECONDS))
+    )
+    const savedUpdatePolicy = ctx.storage.get('updates.checkMode', 'auto')
+    updateCheckMode.set(UPDATE_CHECK_MODES.has(savedUpdatePolicy) ? savedUpdatePolicy : 'auto')
+    updateCheckIntervalSeconds.set(
+      normalizeUpdateCheckIntervalSeconds(
+        ctx.storage.get('updates.intervalSeconds', DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS)
+      )
+    )
 
-    void checkCompatibility(true).then(() => reconcile('startup'))
+    void checkCompatibility(true).then(() =>
+      reconcile('startup', { mutate: repairScheduleMode.get() === 'auto' })
+    )
+    if (updateCheckMode.get() !== 'off') {
+      void checkForUpdates('startup')
+    }
     void startDirectoryWatch().catch(error => warn('directory watch unavailable:', String(error)))
 
     if (window.hermesDesktop?.onConnectionApplied) {
       stopConnectionApplied = window.hermesDesktop.onConnectionApplied(() => {
         compatibilityLastCheckedAt = 0
-        void checkCompatibility(true).then(() => reconcile('connection-applied'))
+        void checkCompatibility(true).then(() =>
+          reconcile('connection-applied', { mutate: repairScheduleMode.get() === 'auto' })
+        )
+        if (updateCheckMode.get() === 'auto') {
+          void checkForUpdates('connection-applied')
+        }
       })
     }
 
-    timer = setInterval(() => {
-      void reconcile('timer')
-    }, CHECK_MS)
+    configureRepairTimer()
+    configureUpdateCheckTimer()
 
     ctx.onDispose?.(() => {
       if (timer) clearInterval(timer)
       timer = null
+      if (updateTimer) clearInterval(updateTimer)
+      updateTimer = null
       stopDirectoryEvents?.()
       stopDirectoryEvents = null
       stopConnectionApplied?.()
@@ -2686,4 +3856,4 @@ const plugin = {
 }
 
 export default plugin
-export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, scanCoreTamperSource, hasCoreProtectionBlocker, runPreflight, preflightDecision, coreApprovalKey, coreApprovalEffective, setCoreVersionApproval, isCoreVersionApproved, evaluateCompatibilityChecks, parseGitHubInstallIdentifier, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile, safeCliPluginName }
+export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, scanCoreTamperSource, hasCoreProtectionBlocker, runPreflight, preflightDecision, coreApprovalKey, coreApprovalEffective, setCoreVersionApproval, isCoreVersionApproved, evaluateCompatibilityChecks, parseGitHubInstallIdentifier, shouldScanRuntimePath, normalizeRepairIntervalSeconds, repairTimerDelayMs, isAutomaticRepairReason, normalizeUpdateCheckIntervalSeconds, updateCheckTimerDelayMs, compareVersions, updateItemKey, dedupeUpdateItems, isUpdateItemApplicable, isHermesScannerBlockedResult, selectedUpdateItems, writeDesktopFilesTransactional, applyConfirmedUpdates, updatePlanState, updateReviewState, compatibilityState, operationBusy, localPluginInventory, buildHalfRows, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile, safeCliPluginName }

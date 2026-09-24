@@ -1,89 +1,163 @@
 # Security
 
-Hermes Desktop plugins are not sandboxed. They run with the Desktop application's authority, so Mender treats automatic repair as a supply-chain operation.
+Hermes Desktop plugins are not sandboxed. They run with the Desktop application's authority, so Hermes Mender treats repair, installation, and update as supply-chain operations.
 
 ## Trust model
 
-Automatic repair requires:
+Mender-controlled mutations require the strongest identity information available for that path:
 
-- a Hermes catalog entry;
-- an immutable 40-character commit SHA;
+- a Hermes catalog entry where applicable;
+- an immutable 40-character Git commit SHA for checked Git sources;
 - an unambiguous plugin/package match;
-- for Desktop-to-server repair, `probePluginRepo` confirmation that the package has both halves.
+- package-shape confirmation before reconstructing a missing half;
+- a fresh review when Core-sensitive source changes.
 
-Existing plugin destinations are never force-overwritten.
+Existing plugin destinations are not blindly force-overwritten.
 
 ## Static preflight
 
-Mender inspects bounded source before automatic repair.
+Mender performs bounded source inspection before Mender-controlled install, repair, and update.
 
-Current rule groups cover:
+Current rule groups include:
 
-- dynamic code execution;
-- embedded private-key material;
+- dynamic execution and Function/eval-style behavior;
+- embedded private-key material and secret-like literals;
 - gateway shell/CLI execution;
 - process-execution libraries;
 - Desktop file/plugin mutation capabilities;
-- outbound network surfaces;
-- environment/secret access;
-- clipboard and external-URL access.
+- outbound network and environment access;
+- clipboard and external-URL access;
+- computed dynamic module loading;
+- decode-then-execute / obfuscation chains;
+- mutable remote dependency sources;
+- immutable remote dependency pins;
+- install lifecycle scripts that execute external commands;
+- Hermes Core path/runtime/package-manager mutation patterns.
 
-Security policy is user-selectable and persisted with Hermes plugin storage:
+Security policy is user-selectable and persisted:
 
-- **Smart**: critical findings block; high/medium findings are review signals.
-- **Strict**: critical and high findings block.
-- **Off**: Mender's supplemental scan is skipped.
+- **Smart** — critical findings block; high/medium findings are review signals.
+- **Strict** — critical and high findings block.
+- **Off** — Mender's supplemental Security scan is skipped.
 
-Off never changes Hermes Core's `plugins.scan_on_install` setting. Server-side plugin installation remains subject to the host-owned Hermes scanner.
+Off never changes Hermes Core's host-owned plugin scanning.
 
-This scanner deliberately does **not** say that a plugin is safe. Static inspection can miss obfuscated, indirect, dependency-driven, or runtime behavior.
+Mender's scanner deliberately does **not** claim that a plugin is safe. Static inspection can miss indirect, runtime, dependency-driven, or intentionally disguised behavior.
 
-## Relationship to Hermes Plugin Guard
+## Relationship to the Hermes host scanner
 
-The unrelated community project named **Hermes Plugin Guard** is a broader static scanner for Hermes Agent/Python plugins. Mender does not install it, replace it, or depend on it. Mender's scanner is scoped to the sources involved in Mender's own automatic reconciliation so the two projects do not compete for installation control.
+Hermes itself runs a host-owned Plugin Guard during plugin install/re-pin when `plugins.scan_on_install` is enabled. Mender does not replace or disable it.
+
+The two layers have different purposes:
+
+- Mender preflight lets the Desktop show source/security/Core context before a Mender-controlled action;
+- Hermes Plugin Guard is the host-side enforcement backstop before a server/catalog install is accepted.
+
+A Hermes `dangerous` verdict remains blocked even if Mender's own policy would otherwise allow the operation.
+
+The current Hermes dashboard update contract is not identical to the install contract: a catalog re-pin blocked by Plugin Guard can arrive as `ok:false` with an error beginning `Security scan blocked plugin install...` without `scan_blocked:true`. Mender recognizes both the structured flag and that host error so the UI classifies the result as a Hermes scanner block rather than a generic update failure.
+
+This behavior has a retained isolated backend regression test under `tests/e2e/`.
 
 ## Data
 
-Mender contains no user-specific names, machine IDs, hostnames, addresses, tokens, server IPs, or account identifiers.
+Mender contains no user-specific hostnames, addresses, tokens, server IPs, machine IDs, or account identifiers.
 
-Diagnostics are written locally to the Hermes cache and normal Desktop log only.
+Diagnostics are written only to local Hermes state/log surfaces used by Mender.
 
-## Activation policy
+## Repair and activation policy
 
 Repair and activation are separate decisions.
 
-By default, a reconstructed Agent/server half is installed with `enable: false`. The Mender row then exposes an explicit **Enable** action using Hermes' canonical plugin key. Users can opt into automatic enablement with the persisted UI switch, but the Hermes install scan still runs first.
+By default, a reconstructed Agent/server half is installed disabled. The Mender row exposes **Enable** or **Disable** according to the actual gateway status. Users can separately opt into automatic enablement of repaired Agent halves; Hermes security checks still run first.
+
+Manual GitHub install actions are explicit:
+
+- **Install** guarantees the Agent half is left disabled;
+- **Install & enable** explicitly enables it.
+
+The persisted **Enable after install** preference is only the default for the repository field's Enter action; it does not alter the meaning of those buttons.
 
 ## Update policy
 
-**Update all** never auto-accepts a capability-widening catalog update. Hermes returns `consent_required`; Mender reports that as review-required and leaves the installed tree unchanged.
+### Discovery is not installation
 
-Desktop-only updates are Mender-scanned before any file is changed. Packages with unsupported non-text Desktop payloads are skipped for review rather than guessed at.
+Automatic update checking may be enabled, scheduled, or turned off. Discovery never applies an update.
+
+All normal plugin updates, Desktop-only updates, Update-all batches, and Mender self-updates use one deduplicated update plan and require explicit confirmation in **Review updates** before application.
+
+### Capability widening
+
+Mender never auto-accepts a capability-widening catalog re-pin.
+
+Hermes returns `consent_required` plus a surface delta; Mender holds that item for review and does not send `accept_capabilities: true` automatically.
+
+### Hermes scanner blocks
+
+Hermes Plugin Guard remains authoritative for host-side install/re-pin blocking. Scanner-blocked candidates are never treated as successful updates.
+
+### Multi-candidate batches
+
+A confirmed batch isolates candidates. One candidate that fails, needs capability review, or is blocked by the Hermes scanner does not silently convert unrelated candidates into failures and does not auto-approve the blocked item.
+
+### Desktop-only updates
+
+Desktop-only catalog updates are inspected before writing.
+
+Only supported text payloads are updated in place. The write path is transactional: Mender records previous contents before writing and restores already-written files if a later write fails. Unsupported payload shapes are held for review rather than guessed at.
+
+### Mender self-update
+
+Mender self-update is part of the same update plan.
+
+The self-update path:
+
+1. resolves the canonical channel to an exact GitHub SHA;
+2. validates Mender `VERSION`, plugin ID, and source;
+3. runs Mender Security/Core preflight against that SHA;
+4. shows the normal review UI;
+5. after explicit confirmation, re-resolves the SHA and re-runs preflight;
+6. replaces only the local Mender runtime file;
+7. restores the previous file if the write fails.
+
+No Mender self-update is installed automatically.
+
+When the running Mender is **Unsupported**, self-update recovery is offered only if the minimal local Desktop root/read/write APIs required for safe replacement still work. Mender does not bypass a missing local write path by patching Hermes Core.
 
 ## Core-integrity policy
 
-Mender keeps Core-integrity checks separate from general malware/capability findings.
+Core-integrity checks are separate from general Security findings.
 
-- **Smart** pauses on detected Core tampering and requires a decision.
-- **Strict** blocks detected Core tampering and offers no per-version bypass.
-- **Off** allows Core tampering at the Mender layer.
+- **Smart** — detected Core tampering pauses and requires a decision.
+- **Strict** — detected Core tampering is blocked and has no per-version bypass.
+- **Off** — Mender allows Core tampering at its layer.
 
-A deliberate exception can be created only in Smart, for an exact plugin identity + 40-character commit SHA. That approval is stored separately, shown in the UI, can be revoked, and is not inherited by another commit. Strict ignores stored Smart approvals. The exception affects Core protection only; it cannot override a general Security-mode block or Hermes' own host scanner.
+A deliberate exception exists only in Smart and is bound to exact plugin identity + full 40-character commit SHA. The approval is persisted separately, visible in the UI, revocable, and not inherited by another commit. Strict ignores stored Smart approvals.
 
-Direct imports of Hermes internals are review signals rather than automatic malware verdicts. Declared, supported Hermes capabilities such as `tools.override` and `llm.model_override` are not considered Core tampering on their own.
+A Core exception cannot override a general Security block or Hermes Plugin Guard.
 
-This is defense-in-depth, not a sandbox. In-process plugins inherit the permissions of the Hermes process. A read-only/immutable Hermes application tree remains the strongest technical boundary against runtime Core modification.
+Direct imports of Hermes internals are review signals rather than automatic malware verdicts. Supported extension declarations such as `tools.override` and `llm.model_override` are not Core tampering by themselves.
+
+This is defense-in-depth, not a sandbox. In-process plugins inherit Hermes Desktop/process permissions.
 
 ## Uninstall fallback safety
 
-The compatibility fallback is used only when the connected gateway rejects the current remove RPC with the specific legacy-contract error. Mender validates the canonical plugin name against a strict allowlist before composing the official `hermes plugins remove <name>` command. Arbitrary shell text is never accepted from the UI.
+Uninstall uses Hermes' normal package-removal path and a Hermes SDK confirmation dialog.
 
-## Arbitrary GitHub Desktop install limitation
+The legacy compatibility fallback is used only when the connected gateway rejects the current remove RPC with the specific old-contract error. Mender validates the canonical plugin name against a strict allowlist before composing the official `hermes plugins remove <name>` command.
 
-For Agent/server halves, Mender passes the resolved full commit SHA as `ref` to Hermes, so the host installs the exact source that Mender inspected.
+Arbitrary shell text is never accepted from the Mender UI.
 
-The current Hermes Desktop `installDesktopPlugin` bridge does not expose a Git ref/SHA parameter. For a non-catalog GitHub Desktop plugin, Hermes therefore performs its normal Git clone first; Mender then immediately reconciles the materialized Desktop files to the already-inspected SHA.
+## Public GitHub install safety
 
-That closes final-state drift but is **not an atomic pre-execution sandbox**: a moving branch could theoretically change between Mender's inspection and Hermes' Desktop clone. Users who require a fully immutable Desktop supply-chain path should prefer curated catalog pins or wait for an upstream Desktop installer that accepts an immutable ref.
+For Agent/server halves, Mender resolves and inspects a full commit SHA and passes that SHA as `ref` to Hermes.
 
-An exact-version Core approval applies to the SHA Mender inspected; it does not convert this Desktop bridge limitation into a sandbox guarantee.
+For unified packages, Mender first asks Hermes to materialize the Desktop half from the already installed Agent package, avoiding a second clone where possible.
+
+### Standalone Desktop Git limitation
+
+Hermes' current standalone `installDesktopPlugin` bridge does not expose a Git ref/SHA parameter. If a separate Desktop clone is required, Hermes performs its normal clone first and Mender then reconciles the final files to the inspected SHA.
+
+That gives an exact final state but is **not an atomic pre-execution sandbox**. A moving branch could theoretically change between inspection and clone/reconcile. Users who require a fully immutable Desktop installation path should prefer catalog/unified materialization or an upstream Desktop installer that accepts an immutable ref.
+
+An exact-version Core approval does not remove this bridge limitation.
