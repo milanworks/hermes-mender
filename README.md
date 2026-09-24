@@ -11,7 +11,7 @@ Mender reconciles both directions:
 
 ```
 Agent/server half -> missing Desktop half -> restore Desktop half
-Desktop half -> missing Agent/server half -> install through plugins.manage
+Desktop half -> missing Agent/server half -> install through plugins.manage (disabled by default)
 ```
 
 It does not patch Hermes Core, edit the database, install a Windows service, require SSH, or run a separate shell watcher.
