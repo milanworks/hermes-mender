@@ -621,7 +621,7 @@ async function ensureAgentHalves(desktop, root, report = null, skipCatalogs = ne
       const result = await host.request('plugins.manage', {
         action: 'install',
         catalog_name: entry.name,
-        enable: true
+        enable: false
       })
 
       if (!result?.ok) {
