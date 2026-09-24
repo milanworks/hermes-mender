@@ -1,0 +1,7 @@
+name: mender-core-review-fixture
+version: 0.0.0-test
+manifest_version: 1
+api_version: 1
+description: Inert Hermes Mender E2E fixture for exact-SHA Core protection review.
+requires_hermes: ">=0.21"
+tags: [testing, mender, core-protection]
