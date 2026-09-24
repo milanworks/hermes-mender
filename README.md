@@ -1,4 +1,3 @@
-# Hermes Mender
 
 **by [@milanworks](https://github.com/milanworks)**
 
@@ -27,6 +26,18 @@ Mender stays inside documented Hermes surfaces:
 - the Desktop plugin root and native directory watcher;
 - the Desktop installer with `force: false`;
 - the catalog's immutable pinned commit SHA.
+
+## Compatibility check
+
+Mender does not trust a hardcoded Hermes version string. At runtime it checks the Desktop bridge and active gateway contract it actually depends on.
+
+The UI reports:
+
+- **Compatible** — all required and optional Mender surfaces are available.
+- **Degraded** — required repair/status paths work, but one or more optional features need a fallback or are unavailable.
+- **Unsupported** — a required API/contract is missing. Mender pauses automatic mutations instead of guessing.
+
+Hermes Desktop itself error-isolates runtime plugins: a load/register failure is rolled back and the plugin row is published with an error state rather than taking down the app. Mender's compatibility check runs after the module successfully loads and protects against later SDK/gateway contract drift.
 
 ## UI
 
@@ -65,10 +76,10 @@ This compatibility path exists for Desktop/gateway contract skew; it is not a se
 Core protection is separate from the general security preflight and has intentionally different mode semantics:
 
 - **Smart** (default): detected Core tampering pauses the Mender-controlled install/repair/update and asks for a decision.
-- **Strict**: detected Core tampering is blocked by default.
+- **Strict**: detected Core tampering is blocked. Strict has no per-version bypass.
 - **Off**: Mender allows Core tampering. Hermes' native malware scan and capability consent remain separate and active.
 
-When Smart pauses, or when a user intentionally wants one Core-changing plugin despite Strict, Mender can store **Allow this exact version**. The exception is bound to the plugin identity plus the full 40-character commit SHA, is visible/revocable in the UI, and does not carry to a future update.
+Only Smart exposes **Allow this exact version**. The exception is bound to the plugin identity plus the full 40-character commit SHA, is visible/revocable in the UI, and does not carry to a future update. Switching to Strict ignores stored Smart approvals until the user returns to Smart.
 
 A Core exception never bypasses the normal Security mode. A general malware/secret security block has no Core-override button.
 
@@ -88,6 +99,8 @@ The flow:
 6. never create a second copy merely to update/repair an existing destination.
 
 **Enable after install** defaults to Off. Private repositories should use Hermes' normal installer because Hermes deliberately keeps its Git credential handling out of third-party Desktop plugins.
+
+**Desktop bridge limitation:** Agent halves are installed at the exact resolved SHA. Hermess current Desktop installer has no `ref` parameter, so custom GitHub Desktop installs are reconciled to the checked SHA immediately after Hermess normal clone rather than being atomically cloned at that SHA. See [SECURITY.md](SECURITY.md).
 
 ## Security preflight
 

@@ -9,7 +9,7 @@ import { host, atom, useValue, Button, ROUTES_AREA, STATUSBAR_AREAS, PALETTE_ARE
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-mender'
-const VERSION = '0.6.0-dev'
+const VERSION = '0.7.0-dev'
 const CHECK_MS = 20000
 let timer = null
 let running = false
@@ -33,10 +33,160 @@ const installState = atom({
   identity: null,
   sha: null,
   probe: null,
-  canApproveCore: false
+  canApproveCore: false,
+  reviewFindings: []
+})
+const compatibilityState = atom({
+  status: 'checking',
+  checkedAt: null,
+  summary: 'Compatibility has not been checked yet.',
+  checks: []
 })
 const UNINSTALL_TOMBSTONE_TTL_MS = 10 * 60 * 1000
+const COMPATIBILITY_CACHE_MS = 60 * 1000
+let compatibilityLastCheckedAt = 0
+let stopConnectionApplied = null
 let pluginStorage = null
+
+function evaluateCompatibilityChecks(checks) {
+  const rows = Array.isArray(checks) ? checks : []
+  const requiredFailures = rows.filter(check => check.required && !check.ok)
+  const optionalFailures = rows.filter(check => !check.required && !check.ok)
+
+  if (requiredFailures.length) {
+    return {
+      status: 'unsupported',
+      summary:
+        'Required Hermes APIs are missing: ' +
+        requiredFailures.map(check => check.label).join(', ') +
+        '. Automatic Mender mutations are paused.'
+    }
+  }
+
+  if (optionalFailures.length) {
+    return {
+      status: 'degraded',
+      summary:
+        'Mender can run, but some features use fallbacks or are unavailable: ' +
+        optionalFailures.map(check => check.label).join(', ') +
+        '.'
+    }
+  }
+
+  return {
+    status: 'compatible',
+    summary: 'All Hermes APIs required by this Mender build are available.'
+  }
+}
+
+async function checkCompatibility(force = false) {
+  const now = Date.now()
+  const current = compatibilityState.get()
+
+  if (
+    !force &&
+    current?.status !== 'checking' &&
+    now - compatibilityLastCheckedAt < COMPATIBILITY_CACHE_MS
+  ) {
+    return current
+  }
+
+  const desktop = window.hermesDesktop
+  const checks = []
+  const add = (id, label, ok, required, detail = '') =>
+    checks.push({ id, label, ok: Boolean(ok), required: Boolean(required), detail })
+
+  add('desktop.bridge', 'Desktop bridge', Boolean(desktop), true)
+  add('desktop.root', 'desktopPluginsRoot()', typeof desktop?.desktopPluginsRoot === 'function', true)
+  add('desktop.readDir', 'readDir()', typeof desktop?.readDir === 'function', true)
+  add(
+    'desktop.readText',
+    'readFileText()/readPluginSource()',
+    typeof desktop?.readFileText === 'function' || typeof desktop?.readPluginSource === 'function',
+    true
+  )
+
+  add('desktop.probe', 'probePluginRepo()', typeof desktop?.probePluginRepo === 'function', false)
+  add('desktop.install', 'installDesktopPlugin()', typeof desktop?.installDesktopPlugin === 'function', false)
+  add('desktop.write', 'writeTextFile()', typeof desktop?.writeTextFile === 'function', false)
+  add('desktop.trash', 'trashPath()', typeof desktop?.trashPath === 'function', false)
+  add('desktop.rename', 'renamePath()', typeof desktop?.renamePath === 'function', false)
+  add(
+    'desktop.watch',
+    'native directory watch',
+    typeof desktop?.watchDirectory === 'function' && typeof desktop?.onPreviewFileChanged === 'function',
+    false,
+    'The 20-second reconcile timer remains as fallback.'
+  )
+  add(
+    'desktop.reconcile',
+    'reconcileDesktopPlugins()',
+    typeof desktop?.reconcileDesktopPlugins === 'function',
+    false
+  )
+  add(
+    'desktop.remove',
+    'removeDesktopPlugin()',
+    typeof desktop?.removeDesktopPlugin === 'function',
+    false,
+    'Mender can fall back to trashPath for supported local cases.'
+  )
+
+  try {
+    const response = await host.request('plugins.manage', { action: 'list' })
+    const rows = Array.isArray(response?.plugins) ? response.plugins : null
+    add('gateway.plugins.list', 'plugins.manage list', Boolean(rows), true)
+
+    if (rows) {
+      const userRows = rows.filter(row => row?.source !== 'bundled')
+      const shapeOk =
+        !userRows.length ||
+        userRows.every(row => typeof row?.name === 'string' && typeof row?.status === 'string')
+      add(
+        'gateway.plugins.shape',
+        'plugin row contract',
+        shapeOk,
+        true,
+        'Mender needs plugin name/status fields from the active gateway.'
+      )
+
+      const unifiedRows = userRows.filter(row => row?.has_desktop_half)
+      const unifiedShapeOk =
+        !unifiedRows.length ||
+        unifiedRows.every(row => typeof row?.key === 'string' && row?.key && row?.name)
+      add(
+        'gateway.plugins.keys',
+        'canonical plugin keys',
+        unifiedShapeOk,
+        false,
+        'Per-plugin enable/disable actions need the gateway-provided canonical key.'
+      )
+    }
+  } catch (error) {
+    add(
+      'gateway.plugins.list',
+      'plugins.manage list',
+      false,
+      true,
+      error instanceof Error ? error.message : String(error)
+    )
+  }
+
+  const verdict = evaluateCompatibilityChecks(checks)
+  const next = {
+    ...verdict,
+    checkedAt: new Date().toISOString(),
+    checks
+  }
+
+  compatibilityLastCheckedAt = now
+  compatibilityState.set(next)
+  return next
+}
+
+function compatibilityAllowsMutations() {
+  return compatibilityState.get()?.status !== 'unsupported'
+}
 
 function freshState() {
   return {
@@ -213,6 +363,10 @@ function isCoreVersionApproved(identity, sha) {
   return Boolean(key && coreVersionApprovals.get()?.[key])
 }
 
+function coreApprovalEffective(mode, storedApproval) {
+  return mode === 'smart' && Boolean(storedApproval)
+}
+
 function setCoreVersionApproval(identity, sha, allowed = true) {
   const key = coreApprovalKey(identity, sha)
   if (!key) return false
@@ -241,16 +395,18 @@ function runPreflight(files, context = {}) {
 
   const coreMode = coreProtectionMode.get()
   const coreTamper = core.some(finding => finding.severity === 'critical' || finding.severity === 'high')
-  const approved = isCoreVersionApproved(context.identity, context.sha)
+  const storedApproval = isCoreVersionApproved(context.identity, context.sha)
+  const smartApproval = coreApprovalEffective(coreMode, storedApproval)
 
   return {
     findings: [...security, ...core],
     securityBlocked: hasBlockingFinding(security),
-    coreBlocked: !approved && hasCoreProtectionBlocker(core, coreMode),
-    reviewRequired: !approved && coreMode === 'smart' && coreTamper,
-    coreApproved: approved,
+    coreBlocked: hasCoreProtectionBlocker(core, coreMode),
+    reviewRequired: !smartApproval && coreMode === 'smart' && coreTamper,
+    coreApproved: smartApproval,
+    storedCoreApproval: storedApproval,
     approvalKey: coreApprovalKey(context.identity, context.sha),
-    blocked: hasBlockingFinding(security) || (!approved && hasCoreProtectionBlocker(core, coreMode))
+    blocked: hasBlockingFinding(security) || hasCoreProtectionBlocker(core, coreMode)
   }
 }
 
@@ -266,7 +422,7 @@ function preflightDecision(preflight, identity, sha) {
   }
 
   if (preflight?.coreBlocked || preflight?.reviewRequired) {
-    const approvalKey = coreApprovalKey(identity, sha)
+    const approvalKey = preflight?.reviewRequired ? coreApprovalKey(identity, sha) : null
     return {
       allowed: false,
       stage: preflight.coreBlocked ? 'core-blocked' : 'core-review-required',
@@ -1057,6 +1213,22 @@ async function reconcile(reason = 'timer') {
   menderState.set({ ...menderState.get(), running: true, reason, error: null })
 
   try {
+    const compatibility = await checkCompatibility(reason === 'startup' || reason === 'connection-applied')
+    report.compatibility = compatibility
+
+    if (compatibility.status === 'unsupported') {
+      report.error = compatibility.summary
+      lastRun = report
+      menderState.set({
+        ...menderState.get(),
+        running: false,
+        at: report.at,
+        reason,
+        error: compatibility.summary
+      })
+      return report
+    }
+
     desktop = window.hermesDesktop
     if (!desktop?.desktopPluginsRoot || !desktop?.readDir) {
       throw new Error('Required Hermes Desktop bridge is unavailable')
@@ -1113,6 +1285,9 @@ async function reconcile(reason = 'timer') {
         canApproveCore: Boolean(item.canApproveCore),
         approvalIdentity: item.approvalIdentity || null,
         approvalSha: item.approvalSha || null,
+        reviewFindings: (item.findings || [])
+          .filter(finding => finding.source === 'core-protection')
+          .slice(0, 8),
         resume: 'repair'
       }))
 
@@ -1310,7 +1485,8 @@ async function installFromInput() {
     identity: null,
     sha: null,
     probe: null,
-    canApproveCore: false
+    canApproveCore: false,
+    reviewFindings: []
   })
 
   try {
@@ -1364,12 +1540,15 @@ async function installFromInput() {
           decision.stage === 'security-blocked'
             ? 'General security policy blocked this install. Core exceptions cannot override it.'
             : decision.stage === 'core-blocked'
-              ? 'Core protection Strict blocked this exact version. You can explicitly allow only this SHA below.'
+              ? 'Core protection Strict blocked this exact version. Strict has no per-version bypass; switch to Smart or Off if you intentionally want Core-changing code.'
               : 'Core protection Smart requires approval before this exact version can be installed.',
         identity: target.identity,
         sha,
         probe: { agent: hasAgent, desktop: hasDesktop },
-        canApproveCore: decision.canApproveCore
+        canApproveCore: decision.canApproveCore,
+        reviewFindings: preflight.findings
+          .filter(finding => finding.source === 'core-protection')
+          .slice(0, 12)
       })
       return
     }
@@ -1453,7 +1632,8 @@ async function installFromInput() {
       identity: target.identity,
       sha,
       probe: { agent: hasAgent, desktop: hasDesktop },
-      canApproveCore: false
+      canApproveCore: false,
+      reviewFindings: []
     })
   } catch (error) {
     installState.set({
@@ -1527,6 +1707,9 @@ async function updateDesktopOnlyPackages(desktop, root, catalog, actions, findin
         canApproveCore: decision.canApproveCore,
         approvalIdentity: decision.approvalIdentity,
         approvalSha: decision.approvalSha,
+        reviewFindings: preflight.findings
+          .filter(finding => finding.source === 'core-protection')
+          .slice(0, 8),
         resume: 'update'
       })
       continue
@@ -1646,6 +1829,9 @@ async function updateAllPlugins() {
               canApproveCore: decision.canApproveCore,
               approvalIdentity: decision.approvalIdentity,
               approvalSha: decision.approvalSha,
+              reviewFindings: preflight.findings
+                .filter(finding => finding.source === 'core-protection')
+                .slice(0, 8),
               resume: 'update'
             })
             continue
@@ -1661,7 +1847,8 @@ async function updateAllPlugins() {
           actions.push({
             plugin: row.catalog_name,
             type: 'update-review-required',
-            detail: (result.delta_lines || []).slice(0, 4).join(' · ') || 'Update widens plugin capabilities.'
+            detail: (result.delta_lines || []).slice(0, 4).join(' · ') || 'Update widens plugin capabilities.',
+            capabilityChanges: (result.delta_lines || []).slice(0, 12)
           })
           continue
         }
@@ -1789,6 +1976,8 @@ function MenderPage() {
   const installValue = useValue(installIdentifier)
   const enableAfterInstall = useValue(installEnableAfter)
   const install = useValue(installState)
+  const compatibility = useValue(compatibilityState)
+  const actionsAllowed = compatibility.status !== 'unsupported' && compatibility.status !== 'checking'
   const securityFindings = (state.findings || []).filter(finding => finding.source !== 'core-protection')
   const coreFindings = (state.findings || []).filter(finding => finding.source === 'core-protection')
   const securityCounts = riskCounts(securityFindings)
@@ -1829,7 +2018,7 @@ function MenderPage() {
               jsx(Button, {
                 size: 'sm',
                 variant: 'outline',
-                disabled: state.running || busy,
+                disabled: state.running || busy || !actionsAllowed,
                 onClick: () => void updateAllPlugins(),
                 children: busy ? 'Working…' : 'Update all'
               }),
@@ -1848,6 +2037,70 @@ function MenderPage() {
       state.error
         ? jsx('div', { className: 'rounded-md border border-red-500/40 p-3 text-red-400', children: state.error })
         : null,
+
+      jsxs('section', {
+        className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-3',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-3',
+            children: [
+              jsxs('div', {
+                children: [
+                  jsx('div', {
+                    className: 'font-medium',
+                    children:
+                      'Compatibility · ' +
+                      (compatibility.status === 'compatible'
+                        ? 'Compatible'
+                        : compatibility.status === 'degraded'
+                          ? 'Degraded'
+                          : compatibility.status === 'unsupported'
+                            ? 'Unsupported'
+                            : 'Checking')
+                  }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children: compatibility.summary
+                  })
+                ]
+              }),
+              jsx(Button, {
+                size: 'sm',
+                variant: 'outline',
+                disabled: busy,
+                onClick: () => void checkCompatibility(true),
+                children: 'Check compatibility'
+              })
+            ]
+          }),
+          (compatibility.checks || []).some(check => !check.ok)
+            ? jsx('div', {
+                className: 'flex flex-col gap-1',
+                children: (compatibility.checks || [])
+                  .filter(check => !check.ok)
+                  .map(check =>
+                    jsxs('div', {
+                      className: 'text-xs text-(--ui-text-secondary)',
+                      children: [
+                        jsx('span', {
+                          className: check.required ? 'font-medium text-red-400' : 'font-medium text-orange-400',
+                          children: check.required ? 'Required: ' : 'Optional: '
+                        }),
+                        jsx('span', { children: check.label }),
+                        check.detail ? jsx('span', { children: ' · ' + check.detail }) : null
+                      ]
+                    }, check.id)
+                  )
+              })
+            : null,
+          compatibility.checkedAt
+            ? jsx('div', {
+                className: 'text-xs text-(--ui-text-quaternary)',
+                children: 'Checked: ' + compatibility.checkedAt
+              })
+            : null
+        ]
+      }),
 
       jsxs('section', {
         className: 'flex flex-col gap-2',
@@ -1898,7 +2151,7 @@ function MenderPage() {
                     className: 'text-xs text-(--ui-text-tertiary)',
                     children:
                       coreMode === 'strict'
-                        ? 'Strict: detected Core tampering is blocked unless you explicitly allow that exact commit SHA.'
+                        ? 'Strict: detected Core tampering is blocked. Strict has no per-version bypass; use Smart for explicit exact-version approval or Off to allow Core changes.'
                         : coreMode === 'off'
                           ? 'Off: Mender allows Core tampering. Hermes native malware scanning and capability consent remain separate and active.'
                           : 'Smart: detected Core tampering pauses and asks. Approval is stored only for that exact plugin + commit SHA.'
@@ -2015,7 +2268,7 @@ function MenderPage() {
               jsx(Button, {
                 size: 'sm',
                 variant: 'outline',
-                disabled: busy || !String(installValue || '').trim(),
+                disabled: busy || !actionsAllowed || !String(installValue || '').trim(),
                 onClick: () => void installFromInput(),
                 children: busy ? 'Checking…' : 'Install'
               })
@@ -2051,6 +2304,24 @@ function MenderPage() {
                           ' · ' +
                           (install.probe.desktop ? 'Desktop ✓' : 'Desktop —') +
                           (install.sha ? ' · SHA ' + String(install.sha).slice(0, 12) : '')
+                      })
+                    : null,
+                  (install.reviewFindings || []).length
+                    ? jsx('div', {
+                        className: 'mt-2 flex flex-col gap-1',
+                        children: (install.reviewFindings || []).map((finding, index) =>
+                          jsxs('div', {
+                            className: 'rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs',
+                            children: [
+                              jsx('span', { className: severityClass(finding.severity) + ' font-medium', children: finding.id }),
+                              jsx('span', { children: ' · ' + finding.label }),
+                              jsx('div', {
+                                className: 'break-all text-(--ui-text-tertiary)',
+                                children: finding.file + ':' + finding.line
+                              })
+                            ]
+                          }, 'install-review-' + finding.id + '-' + index)
+                        )
                       })
                     : null,
                   install.canApproveCore && install.identity && install.sha
@@ -2138,7 +2409,7 @@ function MenderPage() {
                                 ? jsx(Button, {
                                     size: 'xs',
                                     variant: 'outline',
-                                    disabled: busy || state.running,
+                                    disabled: busy || state.running || !actionsAllowed,
                                     onClick: () => void setAgentEnabled(item, true),
                                     children: 'Enable'
                                   })
@@ -2146,7 +2417,7 @@ function MenderPage() {
                               jsx(Button, {
                                 size: 'xs',
                                 variant: 'outline',
-                                disabled: busy || state.running,
+                                disabled: busy || state.running || !actionsAllowed,
                                 onClick: () => void uninstallPlugin(item),
                                 children: 'Uninstall'
                               })
@@ -2200,7 +2471,7 @@ function MenderPage() {
                       coreMode === 'smart'
                         ? 'Smart asks before a detected Core change. Exact-version approval is bound to one SHA.'
                         : coreMode === 'strict'
-                          ? 'Strict blocks detected Core changes unless that exact SHA is explicitly approved.'
+                          ? 'Strict blocks detected Core changes with no exact-version bypass.'
                           : 'Off allows Core changes at the Mender layer; findings remain visible for audit.'
                   }),
                   coreFindings.length
@@ -2244,12 +2515,41 @@ function MenderPage() {
                               jsx('div', {
                                 children: (action.plugin || action.type) + ' · ' + action.type + (action.detail ? ' · ' + action.detail : '')
                               }),
+                              (action.reviewFindings || []).length
+                                ? jsx('div', {
+                                    className: 'mt-2 flex flex-col gap-1',
+                                    children: (action.reviewFindings || []).map((finding, findingIndex) =>
+                                      jsxs('div', {
+                                        className: 'rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs',
+                                        children: [
+                                          jsx('span', { className: severityClass(finding.severity) + ' font-medium', children: finding.id }),
+                                          jsx('span', { children: ' · ' + finding.label }),
+                                          jsx('div', {
+                                            className: 'break-all text-(--ui-text-tertiary)',
+                                            children: finding.file + ':' + finding.line
+                                          })
+                                        ]
+                                      }, action.type + '-finding-' + findingIndex)
+                                    )
+                                  })
+                                : null,
+                              (action.capabilityChanges || []).length
+                                ? jsx('div', {
+                                    className: 'mt-2 flex flex-col gap-1',
+                                    children: (action.capabilityChanges || []).map((line, lineIndex) =>
+                                      jsx('div', {
+                                        className: 'rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs text-(--ui-text-secondary)',
+                                        children: line
+                                      }, action.type + '-cap-' + lineIndex)
+                                    )
+                                  })
+                                : null,
                               action.canApproveCore && action.approvalIdentity && action.approvalSha
                                 ? jsx(Button, {
                                     size: 'xs',
                                     variant: 'outline',
                                     className: 'mt-2',
-                                    disabled: busy || state.running,
+                                    disabled: busy || state.running || !actionsAllowed,
                                     onClick: () =>
                                       applyCoreApproval(
                                         action.approvalIdentity,
@@ -2281,8 +2581,20 @@ function MenderPage() {
 
 function MenderStatus() {
   const state = useValue(menderState)
+  const compatibility = useValue(compatibilityState)
   const counts = riskCounts(state.findings)
-  const label = state.running ? 'Mender…' : state.missing ? 'Mender ' + state.missing : counts.critical ? 'Mender !' : 'Mender ✓'
+  const label =
+    compatibility.status === 'unsupported'
+      ? 'Mender unsupported'
+      : compatibility.status === 'degraded'
+        ? 'Mender degraded'
+        : state.running
+          ? 'Mender…'
+          : state.missing
+            ? 'Mender ' + state.missing
+            : counts.critical
+              ? 'Mender !'
+              : 'Mender ✓'
 
   return jsx('button', {
     type: 'button',
@@ -2307,8 +2619,15 @@ const plugin = {
     respectUninstallIntent.set(Boolean(ctx.storage.get('repair.respectUninstallIntent', true)))
     autoEnableRepairedAgents.set(Boolean(ctx.storage.get('repair.autoEnableAgents', false)))
 
-    void reconcile('startup')
+    void checkCompatibility(true).then(() => reconcile('startup'))
     void startDirectoryWatch().catch(error => warn('directory watch unavailable:', String(error)))
+
+    if (window.hermesDesktop?.onConnectionApplied) {
+      stopConnectionApplied = window.hermesDesktop.onConnectionApplied(() => {
+        compatibilityLastCheckedAt = 0
+        void checkCompatibility(true).then(() => reconcile('connection-applied'))
+      })
+    }
 
     timer = setInterval(() => {
       void reconcile('timer')
@@ -2319,6 +2638,8 @@ const plugin = {
       timer = null
       stopDirectoryEvents?.()
       stopDirectoryEvents = null
+      stopConnectionApplied?.()
+      stopConnectionApplied = null
 
       if (directoryWatchId && window.hermesDesktop?.stopPreviewFileWatch) {
         void window.hermesDesktop.stopPreviewFileWatch(directoryWatchId).catch(() => undefined)
@@ -2365,4 +2686,4 @@ const plugin = {
 }
 
 export default plugin
-export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, scanCoreTamperSource, hasCoreProtectionBlocker, runPreflight, preflightDecision, coreApprovalKey, setCoreVersionApproval, isCoreVersionApproved, parseGitHubInstallIdentifier, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile, safeCliPluginName }
+export const __test = { extractPluginId, githubRepoSlug, scanSource, hasBlockingFinding, scanCoreTamperSource, hasCoreProtectionBlocker, runPreflight, preflightDecision, coreApprovalKey, coreApprovalEffective, setCoreVersionApproval, isCoreVersionApproved, evaluateCompatibilityChecks, parseGitHubInstallIdentifier, shouldScanRuntimePath, catalogEntryForLocal, isExpectedMissingHalf, shouldTreatAsIntentionalAgentRemoval, desktopUpdateTextFile, safeCliPluginName }

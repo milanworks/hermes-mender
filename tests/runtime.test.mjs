@@ -131,6 +131,40 @@ const securityStillBlocks = t.runPreflight(
 assert.equal(t.preflightDecision(securityStillBlocks, 'owner/repo', shaA).stage, 'security-blocked')
 assert.equal(t.preflightDecision(securityStillBlocks, 'owner/repo', shaA).canApproveCore, false)
 
+assert.equal(t.coreApprovalEffective('smart', true), true)
+assert.equal(t.coreApprovalEffective('strict', true), false, 'Strict ignores stored SHA approvals')
+assert.equal(t.coreApprovalEffective('off', true), false)
+
+const strictDecision = t.preflightDecision(
+  { securityBlocked: false, coreBlocked: true, reviewRequired: false },
+  'owner/repo',
+  shaA
+)
+assert.equal(strictDecision.allowed, false)
+assert.equal(strictDecision.stage, 'core-blocked')
+assert.equal(strictDecision.canApproveCore, false, 'Strict exposes no exact-version bypass')
+
+assert.equal(
+  t.evaluateCompatibilityChecks([
+    { id: 'required', label: 'Required', ok: true, required: true },
+    { id: 'optional', label: 'Optional', ok: true, required: false }
+  ]).status,
+  'compatible'
+)
+assert.equal(
+  t.evaluateCompatibilityChecks([
+    { id: 'required', label: 'Required', ok: true, required: true },
+    { id: 'optional', label: 'Optional', ok: false, required: false }
+  ]).status,
+  'degraded'
+)
+assert.equal(
+  t.evaluateCompatibilityChecks([
+    { id: 'required', label: 'Required', ok: false, required: true }
+  ]).status,
+  'unsupported'
+)
+
 const parsedShort = t.parseGitHubInstallIdentifier('owner/repo#catalog')
 assert.equal(parsedShort.slug, 'owner/repo')
 assert.equal(parsedShort.subdir, 'catalog')

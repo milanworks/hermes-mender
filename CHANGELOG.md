@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0-dev
+
+- Add live Hermes compatibility status: Compatible / Degraded / Unsupported.
+- Pause automatic mutations when a required Desktop/gateway API contract is missing.
+- Re-check compatibility on active connection changes.
+- Make Core protection semantics explicit: Smart can approve one exact SHA, Strict has no bypass, Off allows at the Mender layer.
+- Ignore stored Smart SHA approvals while Strict is selected.
+- Expand Smart/Core review cards with exact findings, file, line and SHA context.
+- Show Hermes capability-widening update details instead of a generic Review required line.
+- Keep general Security blocks non-overridable by Core-version approvals.
+
+
 ## 0.6.0-dev
 
 - Change Core protection semantics to Smart = ask, Strict = block, Off = allow at the Mender layer.

@@ -65,10 +65,10 @@ Desktop-only updates are Mender-scanned before any file is changed. Packages wit
 Mender keeps Core-integrity checks separate from general malware/capability findings.
 
 - **Smart** pauses on detected Core tampering and requires a decision.
-- **Strict** blocks detected Core tampering by default.
+- **Strict** blocks detected Core tampering and offers no per-version bypass.
 - **Off** allows Core tampering at the Mender layer.
 
-A deliberate exception can be created only for an exact plugin identity + 40-character commit SHA. That approval is stored separately, shown in the UI, can be revoked, and is not inherited by another commit. The exception affects Core protection only; it cannot override a general Security-mode block or Hermes' own host scanner.
+A deliberate exception can be created only in Smart, for an exact plugin identity + 40-character commit SHA. That approval is stored separately, shown in the UI, can be revoked, and is not inherited by another commit. Strict ignores stored Smart approvals. The exception affects Core protection only; it cannot override a general Security-mode block or Hermes' own host scanner.
 
 Direct imports of Hermes internals are review signals rather than automatic malware verdicts. Declared, supported Hermes capabilities such as `tools.override` and `llm.model_override` are not considered Core tampering on their own.
 
@@ -77,3 +77,13 @@ This is defense-in-depth, not a sandbox. In-process plugins inherit the permissi
 ## Uninstall fallback safety
 
 The compatibility fallback is used only when the connected gateway rejects the current remove RPC with the specific legacy-contract error. Mender validates the canonical plugin name against a strict allowlist before composing the official `hermes plugins remove <name>` command. Arbitrary shell text is never accepted from the UI.
+
+## Arbitrary GitHub Desktop install limitation
+
+For Agent/server halves, Mender passes the resolved full commit SHA as `ref` to Hermes, so the host installs the exact source that Mender inspected.
+
+The current Hermes Desktop `installDesktopPlugin` bridge does not expose a Git ref/SHA parameter. For a non-catalog GitHub Desktop plugin, Hermes therefore performs its normal Git clone first; Mender then immediately reconciles the materialized Desktop files to the already-inspected SHA.
+
+That closes final-state drift but is **not an atomic pre-execution sandbox**: a moving branch could theoretically change between Mender's inspection and Hermes' Desktop clone. Users who require a fully immutable Desktop supply-chain path should prefer curated catalog pins or wait for an upstream Desktop installer that accepts an immutable ref.
+
+An exact-version Core approval applies to the SHA Mender inspected; it does not convert this Desktop bridge limitation into a sandbox guarantee.

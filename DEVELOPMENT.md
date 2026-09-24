@@ -1,4 +1,3 @@
-# Development
 
 ## Branch model
 
@@ -84,7 +83,7 @@ The UI is the source of truth for these switches. The same atoms are consumed by
 
 ### Core protection
 
-`coreProtection.mode` is persisted independently from `security.mode` and defaults to `smart`. Smart pauses and asks on detected Core tampering; Strict blocks; Off allows at the Mender layer. Exact-version exceptions live in `coreProtection.approvals` and are keyed by plugin identity + full commit SHA. All Mender-controlled install/update paths call the same `runPreflight()` / `preflightDecision()` path so Core-protection policy is not duplicated.
+`coreProtection.mode` is persisted independently from `security.mode` and defaults to `smart`. Smart pauses and asks on detected Core tampering; Strict blocks with no bypass; Off allows at the Mender layer. Exact-version exceptions exist only for Smart, live in `coreProtection.approvals`, and are keyed by plugin identity + full commit SHA. Stored Smart approvals are ignored while Strict is selected. All Mender-controlled install/update paths call the same `runPreflight()` / `preflightDecision()` path so Core-protection policy is not duplicated.
 
 ### Enable action
 
@@ -119,3 +118,21 @@ The installer never auto-accepts a general Security-mode block. A Core-protectio
 ### Exact-version Core approvals
 
 `coreApprovalKey(identity, sha)` is the only approval key constructor. Approvals are persisted in plugin storage and are not inherited across commits. Revocation deletes that key. The UI exposes approval only on Core-protection decisions; normal Security findings do not get the override action.
+
+### Compatibility contract
+
+Mender uses feature detection instead of a hardcoded Hermes version range.
+
+Required checks:
+
+- Desktop bridge exists;
+- `desktopPluginsRoot()`;
+- `readDir()`;
+- `readFileText()` or `readPluginSource()`;
+- active gateway answers `plugins.manage list` with the required row shape.
+
+Optional checks cover repo probing, Desktop install/write/trash/rename, native directory watching, Desktop reconcile, standalone Desktop removal and canonical plugin keys.
+
+A required failure produces `unsupported` and pauses automatic Mender mutations. Optional failures produce `degraded` and keep fallback-capable paths available. The check is refreshed on connection changes and periodically cached for normal reconcile cycles.
+
+This is intentionally separate from Hermes' runtime-loader error isolation. If Mender itself cannot be imported or registered, Hermes publishes its row as `error`; Mender cannot self-diagnose code that never loaded.
