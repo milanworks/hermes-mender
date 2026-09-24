@@ -10,7 +10,7 @@ assert.ok(source.includes("const VERSION = '" + version + "'"))
 assert.match(source, /host\.request\('plugins\.manage'/)
 assert.match(source, /action: 'install'/)
 assert.match(source, /catalog_name: entry\.name/)
-assert.match(source, /enable: true/)
+assert.match(source, /enable: false/)
 assert.match(source, /probePluginRepo/)
 assert.match(source, /fetchPinnedRuntimeFiles/)
 
