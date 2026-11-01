@@ -1,0 +1,77 @@
+# Sicherheitsprüfungen (gitleaks, semgrep, tests) – Arbeitsregel vom 01.11.2026.
+# Ergänzt die bestehende CI, ersetzt nichts. Werte werden in Logs redigiert.
+name: Sicherheit
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sicherheit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks CLI v8.30.1 laden (Prüfsumme fest)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      # Geprüft wird die vollständige Historie des geprüften Stands (HEAD inkl. aller Vorgänger),
+      # nicht fremde Branches oder Tags (gitleaks-Standard wäre --all).
+      - name: Historie des geprüften Stands scannen (Werte redigiert)
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --verbose --no-banner --exit-code 1 --log-opts="--full-history HEAD" .'
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: semgrep 1.183.0 installieren
+        run: python -m pip install --disable-pip-version-check --no-cache-dir semgrep==1.183.0
+      # Ausgabe nur als JSON-Datei; im Log stehen Regel, Datei und Zeile, keine Codezeilen oder Werte.
+      - name: semgrep (Regelsatz p/default, Fehler nur bei Severity ERROR)
+        run: |
+          set +e
+          semgrep scan --config p/default --severity ERROR --error --metrics off --disable-version-check --quiet --json --output "$RUNNER_TEMP/semgrep.json"
+          rc=$?
+          set -e
+          python - "$RUNNER_TEMP/semgrep.json" <<'PY2'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          for r in d.get('results', []):
+              print(f"FUND {r['check_id']} {r['path']}:{r['start']['line']}")
+          for e in d.get('errors', []):
+              print(f"HINWEIS {e.get('type')} {e.get('path', '')}")
+          print(f"{len(d.get('results', []))} Funde (Severity ERROR)")
+          PY2
+          exit $rc
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: node --check plugin.js
+      - run: node tests/contract.test.mjs
+      - run: node tests/runtime.test.mjs
